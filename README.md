@@ -1,6 +1,6 @@
 # HiDock P1 USB File Access Tool
 
-Reverse-engineered tool to access recordings from the HiDock P1 recorder via USB, without using the proprietary HiNotes web software.
+Desktop tool to access recordings from the HiDock P1 recorder via USB, without using the proprietary HiNotes web software.
 
 ## Features
 
