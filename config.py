@@ -13,6 +13,8 @@ CONFIG_PATH = Path(__file__).parent / "hidock_config.json"
 _DEFAULTS = {
     "download_dir": "",
     "transcript_output_dir": "",
+    "diarize_enabled": False,
+    "show_timecodes": False,
 }
 
 

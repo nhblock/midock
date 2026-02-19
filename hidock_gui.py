@@ -15,6 +15,7 @@ from tkinter import filedialog
 import customtkinter as ctk
 
 import config
+import diarize
 import hidock_p1
 import transcribe_npu
 
@@ -89,19 +90,24 @@ CLR_TEXT_BRIGHT  = "#ffffff"   # bright text
 CLR_RED          = "#c04030"   # error text
 
 
-class NpuChart(tk.Canvas):
-    """Scrolling bar-chart activity monitor for NPU inference steps.
+class ProcessorChart(tk.Canvas):
+    """Scrolling bar-chart activity monitor for NPU and CPU inference steps.
 
     Fixed-width bars anchored to the right edge — new bars scroll in from
     the right and old ones exit on the left, giving a continuous EKG feel.
+    Supports two series: "npu" (green) and "cpu" (blue).
     """
 
     BAR_W = 4              # fixed px width per bar
     BAR_GAP = 1            # px between bars
     BG = CLR_BG_DARK
-    BAR_COLOR = CLR_GREEN
-    BAR_ENCODER = CLR_YELLOW
-    BAR_DIM = "#2a4018"
+    # NPU colors
+    BAR_NPU = CLR_GREEN
+    BAR_NPU_ENCODER = CLR_YELLOW
+    BAR_NPU_DIM = "#2a4018"
+    # CPU colors
+    BAR_CPU = "#4a9eff"
+    BAR_CPU_DIM = "#1a3a5c"
     REDRAW_MS = 40         # throttle: max ~25 fps
 
     def __init__(self, master, **kwargs):
@@ -109,14 +115,22 @@ class NpuChart(tk.Canvas):
         kwargs.setdefault("highlightthickness", 0)
         kwargs.setdefault("height", 40)
         super().__init__(master, **kwargs)
-        # Each sample: (time_ms, is_encoder)
+        # Each sample: (time_ms, source, is_encoder)
+        # source: "npu" or "cpu"
         self.data = []
         self._redraw_pending = False
         self.bind("<Configure>", lambda e: self._schedule_redraw())
 
-    def add_sample(self, time_ms, is_encoder=False):
-        self.data.append((max(0.01, time_ms), is_encoder))
-        # Trim to max bars that could ever fit on screen (generous limit)
+    def add_sample(self, time_ms, source="npu", is_encoder=False):
+        """Add a timing sample.
+
+        Args:
+            time_ms: inference step duration in milliseconds.
+            source: "npu" or "cpu".
+            is_encoder: True for encoder steps (full-height yellow spike, NPU only).
+        """
+        self.data.append((max(0.01, time_ms), source, is_encoder))
+        # Trim to max bars that could ever fit on screen
         max_bars = max(400, self.winfo_width() // (self.BAR_W + self.BAR_GAP) + 10)
         if len(self.data) > max_bars:
             self.data = self.data[-max_bars:]
@@ -151,28 +165,33 @@ class NpuChart(tk.Canvas):
         if n == 0:
             return
 
-        # Normalize decoder bars among themselves (encoder is always full-height)
-        dec_times = [t for t, enc in visible if not enc]
-        max_dec_ms = max(dec_times) if dec_times else 1.0
+        # Separate rolling max per source for normalization
+        npu_times = [t for t, src, enc in visible if src == "npu" and not enc]
+        cpu_times = [t for t, src, enc in visible if src == "cpu"]
+        max_npu_ms = max(npu_times) if npu_times else 1.0
+        max_cpu_ms = max(cpu_times) if cpu_times else 1.0
 
         # Draw right-aligned: newest bar flush with the right edge
         right_edge = pad + cw
         y_bottom = pad + ch
 
-        for i, (ms, is_enc) in enumerate(visible):
+        for i, (ms, source, is_enc) in enumerate(visible):
             x1 = right_edge - (n - 1 - i) * step
             x0 = x1 - self.BAR_W
+            age = (n - 1 - i) / max(n - 1, 1)
 
-            if is_enc:
-                # Encoder: full-height yellow spike
-                bar_h = ch
-                color = self.BAR_ENCODER
-            else:
-                # Decoder: normalize to decoder-only max, floor at 15%
-                frac = ms / max_dec_ms if max_dec_ms > 0 else 0.5
+            if source == "npu":
+                if is_enc:
+                    bar_h = ch
+                    color = self.BAR_NPU_ENCODER
+                else:
+                    frac = ms / max_npu_ms if max_npu_ms > 0 else 0.5
+                    bar_h = max(ch * 0.15, ch * frac)
+                    color = self.BAR_NPU_DIM if age > 0.7 else self.BAR_NPU
+            else:  # cpu
+                frac = ms / max_cpu_ms if max_cpu_ms > 0 else 0.5
                 bar_h = max(ch * 0.15, ch * frac)
-                age = (n - 1 - i) / max(n - 1, 1)
-                color = self.BAR_DIM if age > 0.7 else self.BAR_COLOR
+                color = self.BAR_CPU_DIM if age > 0.7 else self.BAR_CPU
 
             y0 = y_bottom - bar_h
             self.create_rectangle(x0, y0, x1, y_bottom, fill=color, outline="")
@@ -266,6 +285,7 @@ class HiDockApp(ctk.CTk):
         self.npu_sessions = None   # (encoder, decoder) ONNX sessions
         self.tokenizer = None      # tokenizers.Tokenizer
         self.whisper_loading = False
+        self.diarize_sessions = None  # (seg_sess, emb_sess) for diarization
         self.config = config.load()
         self.sort_key = "date"       # "date" or "duration"
         self.sort_desc = True        # descending by default
@@ -375,11 +395,39 @@ class HiDockApp(ctk.CTk):
         )
         self.transcribe_btn.pack(padx=20, pady=btn_pad, fill="x")
 
-        self.model_label = ctk.CTkLabel(
-            self.sidebar, text="Model not loaded",
-            font=ctk.CTkFont(size=11), text_color=CLR_TEXT_DIM
+        # Diarization toggle
+        self.diarize_var = ctk.BooleanVar(value=self.config.get("diarize_enabled", False))
+        self.diarize_cb = ctk.CTkCheckBox(
+            self.sidebar, text="Speaker Diarization",
+            variable=self.diarize_var, command=self._on_diarize_toggle,
+            font=ctk.CTkFont(size=12), text_color=CLR_TEXT,
+            checkbox_width=20, checkbox_height=20
         )
-        self.model_label.pack(padx=20, pady=(4, 8))
+        self.diarize_cb.pack(padx=24, pady=(2, 0), anchor="w")
+
+        # Timecode toggle
+        self.timecode_var = ctk.BooleanVar(value=self.config.get("show_timecodes", False))
+        self.timecode_cb = ctk.CTkCheckBox(
+            self.sidebar, text="Show Timecodes",
+            variable=self.timecode_var, command=self._on_timecode_toggle,
+            font=ctk.CTkFont(size=12), text_color=CLR_TEXT,
+            checkbox_width=20, checkbox_height=20
+        )
+        self.timecode_cb.pack(padx=24, pady=(2, 4), anchor="w")
+
+        # Model status labels
+        model_font = ctk.CTkFont(size=11)
+        self.diarize_model_label = ctk.CTkLabel(
+            self.sidebar, text="Diarize: not loaded",
+            font=model_font, text_color=CLR_TEXT_DIM
+        )
+        self.diarize_model_label.pack(padx=24, pady=(2, 0), anchor="w")
+
+        self.model_label = ctk.CTkLabel(
+            self.sidebar, text="Whisper: not loaded",
+            font=model_font, text_color=CLR_TEXT_DIM
+        )
+        self.model_label.pack(padx=24, pady=(0, 8), anchor="w")
 
         sep3 = ctk.CTkFrame(self.sidebar, height=1, fg_color=CLR_SEP)
         sep3.pack(padx=20, pady=10, fill="x")
@@ -522,12 +570,18 @@ class HiDockApp(ctk.CTk):
                                           fg_color=CLR_HEADER, corner_radius=0)
         transcript_header.grid(row=2, column=0, sticky="nwe", padx=0, pady=0)
         transcript_header.grid_propagate(False)
-        transcript_label = ctk.CTkLabel(
+        ctk.CTkLabel(
             transcript_header, text="  Transcription Output",
             anchor="w", font=ctk.CTkFont(size=13, weight="bold"),
             text_color=CLR_TEXT
-        )
-        transcript_label.pack(fill="x", padx=8, pady=4)
+        ).pack(side="left", padx=8, pady=4)
+
+        ctk.CTkButton(
+            transcript_header, text="Clear", width=50, height=22,
+            font=ctk.CTkFont(size=11), fg_color=CLR_GREEN_DARK,
+            hover_color=CLR_AMBER, text_color=CLR_TEXT_DIM,
+            corner_radius=6, command=self._clear_transcript
+        ).pack(side="right", padx=8, pady=4)
 
         self.transcript_box = ctk.CTkTextbox(
             self.main_panel, state="disabled",
@@ -536,23 +590,23 @@ class HiDockApp(ctk.CTk):
         )
         self.transcript_box.grid(row=2, column=0, sticky="nswe", padx=0, pady=(30, 0))
 
-        # NPU utilization strip (compact fixed-height sparkline)
-        npu_frame = ctk.CTkFrame(self.main_panel, height=60,
-                                  fg_color=CLR_BG_DARK, corner_radius=0)
-        npu_frame.grid(row=3, column=0, sticky="swe", padx=0, pady=0)
-        npu_frame.grid_propagate(False)
-        npu_frame.grid_columnconfigure(0, weight=1)
-        npu_frame.grid_rowconfigure(1, weight=1)
+        # Processor utilization strip (compact fixed-height sparkline)
+        proc_frame = ctk.CTkFrame(self.main_panel, height=60,
+                                   fg_color=CLR_BG_DARK, corner_radius=0)
+        proc_frame.grid(row=3, column=0, sticky="swe", padx=0, pady=0)
+        proc_frame.grid_propagate(False)
+        proc_frame.grid_columnconfigure(0, weight=1)
+        proc_frame.grid_rowconfigure(1, weight=1)
 
-        npu_label = ctk.CTkLabel(
-            npu_frame, text="  NPU", anchor="w",
+        proc_label = ctk.CTkLabel(
+            proc_frame, text="  Processor Utilization", anchor="w",
             font=ctk.CTkFont(size=10), text_color=CLR_TEXT_DIM,
             fg_color="transparent"
         )
-        npu_label.grid(row=0, column=0, sticky="w", padx=4, pady=(2, 0))
+        proc_label.grid(row=0, column=0, sticky="w", padx=4, pady=(2, 0))
 
-        self.npu_chart = NpuChart(npu_frame, height=38)
-        self.npu_chart.grid(row=1, column=0, sticky="nswe", padx=2, pady=(0, 2))
+        self.proc_chart = ProcessorChart(proc_frame, height=38)
+        self.proc_chart.grid(row=1, column=0, sticky="nswe", padx=2, pady=(0, 2))
 
     # -----------------------------------------------------------------------
     # UI helpers
@@ -582,6 +636,11 @@ class HiDockApp(ctk.CTk):
             self.transcript_box.see("end")
             self.transcript_box.configure(state="disabled")
         self.after(0, _apply)
+
+    def _clear_transcript(self):
+        self.transcript_box.configure(state="normal")
+        self.transcript_box.delete("1.0", "end")
+        self.transcript_box.configure(state="disabled")
 
     def _set_buttons_state(self, connected=False, has_downloads=False):
         def _apply():
@@ -653,6 +712,14 @@ class HiDockApp(ctk.CTk):
         val = self.select_all_var.get()
         for row in self.file_rows:
             row.selected.set(val)
+
+    def _on_diarize_toggle(self):
+        self.config["diarize_enabled"] = self.diarize_var.get()
+        config.save(self.config)
+
+    def _on_timecode_toggle(self):
+        self.config["show_timecodes"] = self.timecode_var.get()
+        config.save(self.config)
 
     def _populate_file_list(self):
         def _apply():
@@ -990,18 +1057,18 @@ class HiDockApp(ctk.CTk):
         self._set_progress_mode(indeterminate=True)
 
         self._set_status("Loading Whisper on NPU (QNN)...")
-        self.after(0, lambda: self.model_label.configure(text="Loading Whisper-Large-V3-Turbo..."))
+        self.after(0, lambda: self.model_label.configure(text="Whisper: loading..."))
         try:
             self.npu_sessions = transcribe_npu.load_sessions()
             self.tokenizer = transcribe_npu.load_tokenizer()
             self.after(0, lambda: self.model_label.configure(
-                text="Whisper-Large-V3-Turbo (NPU)", text_color=CLR_GREEN
+                text="Whisper: Large-V3-Turbo (NPU)", text_color=CLR_GREEN
             ))
             return True
         except Exception as e:
             self._set_status(f"Failed to load Whisper: {e}")
             self.after(0, lambda: self.model_label.configure(
-                text="Model load error", text_color=CLR_RED
+                text="Whisper: load error", text_color=CLR_RED
             ))
             return False
 
@@ -1012,8 +1079,48 @@ class HiDockApp(ctk.CTk):
             chunk_callback=chunk_callback, step_callback=step_callback
         )
 
+    def _load_diarize_models(self):
+        """Lazy-load diarization ONNX models (CPU)."""
+        if self.diarize_sessions is not None:
+            return True
+        self._set_status("Loading diarization models (CPU)...")
+        self.after(0, lambda: self.diarize_model_label.configure(text="Diarize: loading..."))
+        try:
+            self.diarize_sessions = diarize.load_models()
+            self.after(0, lambda: self.diarize_model_label.configure(
+                text="Diarize: pyannote+wespeaker (CPU)", text_color=CLR_GREEN
+            ))
+            return True
+        except Exception as e:
+            self._set_status(f"Failed to load diarization models: {e}")
+            self.after(0, lambda: self.diarize_model_label.configure(
+                text="Diarize: load error", text_color=CLR_RED
+            ))
+            return False
+
+    def _format_diarized(self, results, show_timecodes):
+        """Format diarization results as labeled transcript text.
+
+        Args:
+            results: list of (speaker_id, text, start_s, end_s).
+            show_timecodes: whether to include [MM:SS] prefixes.
+
+        Returns:
+            Formatted transcript string.
+        """
+        lines = []
+        for speaker_id, text, start_s, end_s in results:
+            label = f"[Speaker {speaker_id + 1}]"
+            if show_timecodes:
+                m, s = divmod(int(start_s), 60)
+                tc = f"[{m:02d}:{s:02d}]"
+                lines.append(f"{tc} {label} {text}")
+            else:
+                lines.append(f"{label} {text}")
+        return "\n".join(lines)
+
     def _transcribe_worker(self, rows):
-        # Lazy-load model on first use
+        # Lazy-load Whisper model on first use
         if self.npu_sessions is None:
             if self.whisper_loading:
                 return
@@ -1025,7 +1132,16 @@ class HiDockApp(ctk.CTk):
                 self.whisper_loading = False
                 self._set_progress_mode(indeterminate=False)
 
-        self.after(0, self.npu_chart.clear)
+        use_diarize = self.diarize_var.get()
+        show_timecodes = self.timecode_var.get()
+
+        # Lazy-load diarization models if needed
+        if use_diarize:
+            if not self._load_diarize_models():
+                self.after(0, lambda: self.transcribe_btn.configure(state="normal"))
+                return
+
+        self.after(0, self.proc_chart.clear)
 
         # Compute total audio duration for time-based progress
         total_audio_s = sum(row.file_info["duration"] for row in rows)
@@ -1036,28 +1152,19 @@ class HiDockApp(ctk.CTk):
         for idx, row in enumerate(rows, 1):
             mp3_path = row.downloaded_path
             filename = os.path.basename(mp3_path)
-            last_info = {}
-
-            def on_chunk(info, _files_done=files_done_s):
-                nonlocal last_info
-                last_info = info
-                current_s = _files_done + info["chunk_done_s"]
-                pct = current_s / total_audio_s if total_audio_s > 0 else 0
-                self._set_progress(pct)
-                self._set_status(
-                    f"Transcribing {idx}/{total}: {filename} — "
-                    f"{fmt_mmss(current_s)} of {fmt_mmss(total_audio_s)}"
-                )
-
-            def on_step(step_info):
-                ms = step_info["run_time_ms"]
-                is_enc = step_info["phase"] == "encoder"
-                self.after(0, lambda: self.npu_chart.add_sample(ms, is_enc))
 
             try:
-                text = self._transcribe_file(
-                    mp3_path, chunk_callback=on_chunk, step_callback=on_step
-                )
+                if use_diarize:
+                    text = self._transcribe_file_diarized(
+                        mp3_path, filename, idx, total,
+                        files_done_s, total_audio_s, show_timecodes
+                    )
+                else:
+                    text = self._transcribe_file_plain(
+                        mp3_path, filename, idx, total,
+                        files_done_s, total_audio_s
+                    )
+
                 self._append_transcript(f"\n--- {filename} ---\n{text}\n")
 
                 # Save transcript to disk if output dir configured
@@ -1070,13 +1177,100 @@ class HiDockApp(ctk.CTk):
             except Exception as e:
                 self._append_transcript(f"\n--- {filename} ---\n[Error: {e}]\n")
 
-            files_done_s += last_info.get("audio_duration_s", row.file_info["duration"])
+            files_done_s += row.file_info["duration"]
 
         self._set_progress(1.0)
-        self.after(0, self.npu_chart.clear)
+        self.after(0, self.proc_chart.clear)
         saved_msg = f" — saved to {output_dir}" if output_dir else ""
-        self._set_status(f"Transcription complete — {total} file(s) [NPU]{saved_msg}")
+        mode = "NPU+CPU" if use_diarize else "NPU"
+        self._set_status(f"Transcription complete — {total} file(s) [{mode}]{saved_msg}")
         self.after(0, lambda: self.transcribe_btn.configure(state="normal"))
+
+    def _transcribe_file_plain(self, mp3_path, filename, idx, total,
+                               files_done_s, total_audio_s):
+        """Transcribe a single file without diarization (original pipeline)."""
+        last_info = {}
+
+        def on_chunk(info, _files_done=files_done_s):
+            nonlocal last_info
+            last_info = info
+            current_s = _files_done + info["chunk_done_s"]
+            pct = current_s / total_audio_s if total_audio_s > 0 else 0
+            self._set_progress(pct)
+            self._set_status(
+                f"Transcribing {idx}/{total}: {filename} — "
+                f"{fmt_mmss(current_s)} of {fmt_mmss(total_audio_s)}"
+            )
+
+        def on_step(step_info):
+            ms = step_info["run_time_ms"]
+            is_enc = step_info["phase"] == "encoder"
+            self.after(0, lambda: self.proc_chart.add_sample(ms, "npu", is_enc))
+
+        return self._transcribe_file(
+            mp3_path, chunk_callback=on_chunk, step_callback=on_step
+        )
+
+    def _transcribe_file_diarized(self, mp3_path, filename, idx, total,
+                                  files_done_s, total_audio_s, show_timecodes):
+        """Transcribe a single file with speaker diarization."""
+        seg_sess, emb_sess = self.diarize_sessions
+
+        # Load audio once for both diarization and transcription
+        self._set_status(f"Loading audio {idx}/{total}: {filename}...")
+        audio = transcribe_npu.load_audio_16k(mp3_path)
+        file_duration = len(audio) / transcribe_npu.SAMPLE_RATE
+
+        # Phase 1: Diarization (CPU)
+        def on_diarize_step(info):
+            ms = info["run_time_ms"]
+            self.after(0, lambda: self.proc_chart.add_sample(ms, "cpu"))
+            phase = info.get("phase", "")
+            if phase == "segmentation":
+                win = info.get("window", 0)
+                total_win = info.get("total_windows", 0)
+                self._set_status(
+                    f"Diarizing {idx}/{total}: {filename} — "
+                    f"segmentation {win}/{total_win}"
+                )
+            elif phase == "embedding":
+                seg = info.get("segment", 0)
+                total_seg = info.get("total_segments", 0)
+                self._set_status(
+                    f"Diarizing {idx}/{total}: {filename} — "
+                    f"embedding {seg}/{total_seg}"
+                )
+
+        self._set_status(f"Diarizing {idx}/{total}: {filename}...")
+        segments = diarize.diarize(
+            seg_sess, emb_sess, audio, step_callback=on_diarize_step
+        )
+        num_speakers = len(set(s[2] for s in segments))
+        num_segs = len(segments)
+
+        # Phase 2: Transcribe per segment (NPU)
+        def on_npu_step(step_info):
+            ms = step_info["run_time_ms"]
+            is_enc = step_info["phase"] == "encoder"
+            self.after(0, lambda: self.proc_chart.add_sample(ms, "npu", is_enc))
+
+        def on_segment(info):
+            seg_idx = info["segment_index"]
+            spk = info["speaker_id"] + 1
+            pct_base = files_done_s / total_audio_s if total_audio_s > 0 else 0
+            pct_file = (seg_idx + 1) / num_segs * (file_duration / total_audio_s) if total_audio_s > 0 else 0
+            self._set_progress(pct_base + pct_file)
+            self._set_status(
+                f"Transcribing {idx}/{total}: {filename} — "
+                f"segment {seg_idx + 1}/{num_segs} (Speaker {spk})"
+            )
+
+        results = transcribe_npu.transcribe_segments(
+            self.npu_sessions, self.tokenizer, audio, segments,
+            step_callback=on_npu_step, segment_callback=on_segment,
+        )
+
+        return self._format_diarized(results, show_timecodes)
 
 
 # ---------------------------------------------------------------------------

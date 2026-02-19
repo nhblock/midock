@@ -186,6 +186,12 @@ def load_audio(audio_path):
     return audio.astype(np.float32), sr
 
 
+def load_audio_16k(audio_path):
+    """Load and resample audio to 16 kHz mono. Returns 1-D float32 array."""
+    audio, sr = load_audio(audio_path)
+    return resample(audio, sr, SAMPLE_RATE)
+
+
 def resample(audio, orig_sr, target_sr=SAMPLE_RATE):
     """Resample to target_sr using scipy polyphase filter."""
     if orig_sr == target_sr:
@@ -349,6 +355,63 @@ def transcribe_chunk(encoder_sess, decoder_sess, tokenizer, mel,
 # ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
+
+def transcribe_segments(sessions, tokenizer, audio, segments,
+                        step_callback=None, segment_callback=None):
+    """Transcribe pre-diarized audio segments.
+
+    Args:
+        sessions:  (encoder_sess, decoder_sess) from ``load_sessions()``.
+        tokenizer: from ``load_tokenizer()``.
+        audio: 1-D float32 array, 16 kHz mono (full recording).
+        segments: list of (start_s, end_s, speaker_id) from diarization.
+        step_callback: optional callable(step_info_dict) per decoder step.
+        segment_callback: optional callable(info_dict) after each segment.
+
+    Returns:
+        list of (speaker_id, text) tuples.
+    """
+    encoder_sess, decoder_sess = sessions
+    results = []
+    total = len(segments)
+
+    for seg_idx, (start_s, end_s, speaker_id) in enumerate(segments):
+        start_sample = int(start_s * SAMPLE_RATE)
+        end_sample = int(end_s * SAMPLE_RATE)
+        seg_audio = audio[start_sample:end_sample]
+
+        # Skip very short segments (< 0.3s)
+        if len(seg_audio) < SAMPLE_RATE * 0.3:
+            continue
+
+        # Chunk the segment audio (handles segments > 30s)
+        chunks = chunk_audio(seg_audio)
+        seg_tokens = []
+
+        for chunk in chunks:
+            mel = mel_spectrogram(chunk)
+            tokens = transcribe_chunk(
+                encoder_sess, decoder_sess, tokenizer, mel,
+                step_callback=step_callback,
+            )
+            seg_tokens.extend(tokens)
+
+        text = tokenizer.decode(seg_tokens).strip()
+        if text:
+            results.append((speaker_id, text, start_s, end_s))
+
+        if segment_callback is not None:
+            segment_callback({
+                "segment_index": seg_idx,
+                "num_segments": total,
+                "speaker_id": speaker_id,
+                "start_s": start_s,
+                "end_s": end_s,
+                "text": text,
+            })
+
+    return results
+
 
 def transcribe(sessions, tokenizer, audio_path, chunk_callback=None,
                step_callback=None):

@@ -5,3 +5,4 @@ onnxruntime-qnn>=1.24
 scipy>=1.8.1,<2
 audio2numpy>=0.1.2
 tokenizers>=0.22
+spectralcluster>=0.2  # Speaker diarization clustering
