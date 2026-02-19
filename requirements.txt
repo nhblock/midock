@@ -1,2 +1,7 @@
 pyusb>=1.2.1
 libusb>=1.0.27  # Windows backend
+customtkinter>=5.2.2
+onnxruntime-qnn>=1.24
+scipy>=1.8.1,<2
+audio2numpy>=0.1.2
+tokenizers>=0.22

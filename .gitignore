@@ -23,6 +23,9 @@ hidock_recordings/
 *.swp
 *.swo
 
+# Config
+hidock_config.json
+
 # OS
 .DS_Store
 Thumbs.db

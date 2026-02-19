@@ -40,7 +40,13 @@ if platform.system() == "Windows":
     try:
         import libusb
         # Get the appropriate DLL path for the current architecture
-        arch = "x86_64" if platform.machine().endswith('64') else "x86"
+        machine = platform.machine().lower()
+        if machine in ("arm64", "aarch64"):
+            arch = "arm64"
+        elif machine in ("amd64", "x86_64"):
+            arch = "x86_64"
+        else:
+            arch = "x86"
         dll_path = os.path.join(os.path.dirname(libusb.__file__), 
                                 "_platform", "windows", arch, "libusb-1.0.dll")
         if os.path.exists(dll_path):
@@ -382,10 +388,13 @@ def _parse_file_list_body(data: bytes):
 
     return files
 
-def download_file(dev, filename: str, dest_path: str, file_size: int):
+def download_file(dev, filename: str, dest_path: str, file_size: int, progress_callback=None):
     """
     Download a file from the device using the streaming transfer-file command (cmd 5).
     Falls back to get-file-block (cmd 13) for newer firmware.
+
+    If progress_callback is provided, it is called as progress_callback(bytes_received, file_size)
+    instead of printing progress to stdout. The callback is invoked from the calling thread.
     """
     print(f"[*] Downloading: {filename} ({file_size:,} bytes) -> {dest_path}")
     body = bytes(ord(c) for c in filename)
@@ -426,15 +435,19 @@ def download_file(dev, filename: str, dest_path: str, file_size: int):
 
         pct = int(len(received) / file_size * 100)
         if pct != last_pct:
-            elapsed = time.time() - start
-            rate    = len(received) / elapsed / 1024 if elapsed > 0 else 0
-            print(f"\r    {pct:3d}%  {len(received):,}/{file_size:,} bytes  {rate:.0f} KB/s", end="", flush=True)
+            if progress_callback is not None:
+                progress_callback(len(received), file_size)
+            else:
+                elapsed = time.time() - start
+                rate    = len(received) / elapsed / 1024 if elapsed > 0 else 0
+                print(f"\r    {pct:3d}%  {len(received):,}/{file_size:,} bytes  {rate:.0f} KB/s", end="", flush=True)
             last_pct = pct
 
         if len(received) >= file_size:
             break
 
-    print()
+    if progress_callback is None:
+        print()
     with open(dest_path, "wb") as f:
         f.write(received[:file_size])
     print(f"[+] Saved: {dest_path} ({len(received):,} bytes written)")
