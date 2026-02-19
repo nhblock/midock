@@ -319,8 +319,27 @@ class HiDockApp(ctk.CTk):
         self.info_frame.pack(padx=20, pady=(10, 4), fill="x")
 
         info_font = ctk.CTkFont(size=12)
-        for attr in ("fw_label", "serial_label", "battery_label",
-                      "storage_label", "files_label"):
+        for attr in ("fw_label", "serial_label"):
+            lbl = ctk.CTkLabel(self.info_frame, text="", anchor="w",
+                               font=info_font, text_color=CLR_TEXT)
+            lbl.pack(fill="x")
+            setattr(self, attr, lbl)
+
+        # Battery row: icon canvas + text label
+        self.battery_row = ctk.CTkFrame(self.info_frame, fg_color="transparent")
+        self.battery_row.pack(fill="x")
+        self.battery_canvas = tk.Canvas(
+            self.battery_row, width=28, height=14, bg=CLR_BG_PANEL,
+            highlightthickness=0
+        )
+        self.battery_canvas.pack(side="left", pady=2)
+        self.battery_label = ctk.CTkLabel(
+            self.battery_row, text="", anchor="w",
+            font=info_font, text_color=CLR_TEXT
+        )
+        self.battery_label.pack(side="left", padx=(4, 0))
+
+        for attr in ("storage_label", "files_label"):
             lbl = ctk.CTkLabel(self.info_frame, text="", anchor="w",
                                font=info_font, text_color=CLR_TEXT)
             lbl.pack(fill="x")
@@ -336,14 +355,6 @@ class HiDockApp(ctk.CTk):
             font=btn_font, height=btn_h, corner_radius=btn_radius
         )
         self.dl_selected_btn.pack(padx=20, pady=btn_pad, fill="x")
-
-        self.dl_all_btn = ctk.CTkButton(
-            self.sidebar, text="Download All",
-            command=self._on_download_all, state="disabled",
-            fg_color="#89d466", hover_color="#4ea02a", text_color=CLR_GREEN_DARK,
-            font=btn_font, height=btn_h, corner_radius=btn_radius
-        )
-        self.dl_all_btn.pack(padx=20, pady=btn_pad, fill="x")
 
         self.delete_btn = ctk.CTkButton(
             self.sidebar, text="Delete Selected",
@@ -365,7 +376,7 @@ class HiDockApp(ctk.CTk):
         self.transcribe_btn.pack(padx=20, pady=btn_pad, fill="x")
 
         self.model_label = ctk.CTkLabel(
-            self.sidebar, text="Model: not loaded",
+            self.sidebar, text="Model not loaded",
             font=ctk.CTkFont(size=11), text_color=CLR_TEXT_DIM
         )
         self.model_label.pack(padx=20, pady=(4, 8))
@@ -374,7 +385,7 @@ class HiDockApp(ctk.CTk):
         sep3.pack(padx=20, pady=10, fill="x")
 
         self.dl_dir_btn = ctk.CTkButton(
-            self.sidebar, text="Download Folder...",
+            self.sidebar, text="Set Download Folder",
             command=self._on_choose_download_dir,
             fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
             font=btn_font, height=btn_h, corner_radius=btn_radius
@@ -388,7 +399,7 @@ class HiDockApp(ctk.CTk):
         self.dl_dir_label.pack(padx=20, pady=(2, 4))
 
         self.output_dir_btn = ctk.CTkButton(
-            self.sidebar, text="Transcript Folder...",
+            self.sidebar, text="Set Transcript Folder",
             command=self._on_choose_output_dir,
             fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
             font=btn_font, height=btn_h, corner_radius=btn_radius
@@ -437,8 +448,14 @@ class HiDockApp(ctk.CTk):
         hdr_font = ctk.CTkFont(size=12, weight="bold")
         sort_font = ctk.CTkFont(size=11, weight="bold")
 
-        # Checkbox-width spacer
-        ctk.CTkLabel(header_frame, text="", width=28).grid(row=0, column=0, padx=(4, 0))
+        # Select-all checkbox
+        self.select_all_var = ctk.BooleanVar(value=False)
+        self.select_all_cb = ctk.CTkCheckBox(
+            header_frame, variable=self.select_all_var, text="", width=28,
+            checkbox_width=20, checkbox_height=20,
+            command=self._on_select_all
+        )
+        self.select_all_cb.grid(row=0, column=0, padx=(4, 0))
 
         ctk.CTkLabel(
             header_frame, text="Name", anchor="w", font=hdr_font,
@@ -569,12 +586,10 @@ class HiDockApp(ctk.CTk):
     def _set_buttons_state(self, connected=False, has_downloads=False):
         def _apply():
             if connected:
-                for btn in (self.dl_selected_btn, self.dl_all_btn):
-                    btn.configure(state="normal", fg_color=CLR_GREEN, text_color=CLR_TEXT_BRIGHT)
+                self.dl_selected_btn.configure(state="normal", fg_color=CLR_GREEN, text_color=CLR_TEXT_BRIGHT)
                 self.delete_btn.configure(state="normal", fg_color=CLR_AMBER, text_color=CLR_TEXT_BRIGHT)
             else:
-                for btn in (self.dl_selected_btn, self.dl_all_btn):
-                    btn.configure(state="disabled", fg_color="#89d466", text_color=CLR_GREEN_DARK)
+                self.dl_selected_btn.configure(state="disabled", fg_color="#89d466", text_color=CLR_GREEN_DARK)
                 self.delete_btn.configure(state="disabled", fg_color="#e6be6a", text_color="#6b4a0d")
             if has_downloads:
                 self.transcribe_btn.configure(state="normal", fg_color=CLR_YELLOW, text_color=CLR_GREEN_DARK)
@@ -582,15 +597,39 @@ class HiDockApp(ctk.CTk):
                 self.transcribe_btn.configure(state="disabled", fg_color="#f5ee6e", text_color="#6b6b04")
         self.after(0, _apply)
 
+    def _draw_battery_icon(self, pct):
+        """Draw a cell-phone-style battery icon on the battery canvas."""
+        c = self.battery_canvas
+        c.delete("all")
+        w, h = 24, 12
+        x0, y0 = 1, 1
+        # Outer shell
+        c.create_rectangle(x0, y0, x0 + w, y0 + h, outline=CLR_TEXT, width=1)
+        # Positive terminal nub
+        c.create_rectangle(x0 + w, y0 + 3, x0 + w + 3, y0 + h - 3,
+                           fill=CLR_TEXT, outline="")
+        # Fill level
+        fill_w = max(0, int((w - 2) * min(pct, 100) / 100))
+        if pct > 50:
+            fill_color = CLR_GREEN
+        elif pct > 20:
+            fill_color = CLR_YELLOW
+        else:
+            fill_color = CLR_RED
+        if fill_w > 0:
+            c.create_rectangle(x0 + 1, y0 + 1, x0 + 1 + fill_w, y0 + h - 1,
+                               fill=fill_color, outline="")
+
     def _populate_device_info(self):
         def _apply():
             if self.device_info:
                 self.fw_label.configure(text=f"FW: {self.device_info['version']}")
                 self.serial_label.configure(text=f"SN: {self.device_info['serial']}")
             if self.battery_info:
-                self.battery_label.configure(
-                    text=f"Bat: {self.battery_info['battery']}% ({self.battery_info['status']})"
-                )
+                pct = self.battery_info['battery']
+                status = self.battery_info['status']
+                self.battery_label.configure(text=f"{pct}% ({status})")
+                self._draw_battery_icon(pct)
             self._update_storage_info()
         self.after(0, _apply)
 
@@ -610,6 +649,11 @@ class HiDockApp(ctk.CTk):
             self.storage_label.configure(text="")
             self.files_label.configure(text="")
 
+    def _on_select_all(self):
+        val = self.select_all_var.get()
+        for row in self.file_rows:
+            row.selected.set(val)
+
     def _populate_file_list(self):
         def _apply():
             # Clear existing rows
@@ -617,6 +661,7 @@ class HiDockApp(ctk.CTk):
                 row.destroy()
             self.file_rows.clear()
             self.placeholder_label.pack_forget()
+            self.select_all_var.set(False)
 
             if not self.files:
                 self.placeholder_label.pack(pady=40)
@@ -794,11 +839,6 @@ class HiDockApp(ctk.CTk):
             return
         self._start_download(selected)
 
-    def _on_download_all(self):
-        if not self.file_rows:
-            return
-        self._start_download(self.file_rows)
-
     def _start_download(self, rows):
         out_dir = self.config.get("download_dir", "")
         if not out_dir:
@@ -807,7 +847,6 @@ class HiDockApp(ctk.CTk):
                 return
         # Disable buttons during download
         self.dl_selected_btn.configure(state="disabled")
-        self.dl_all_btn.configure(state="disabled")
         self.connect_btn.configure(state="disabled")
         threading.Thread(
             target=self._download_worker, args=(rows, out_dir), daemon=True
@@ -893,7 +932,6 @@ class HiDockApp(ctk.CTk):
             return
         self.delete_btn.configure(state="disabled")
         self.dl_selected_btn.configure(state="disabled")
-        self.dl_all_btn.configure(state="disabled")
         self.connect_btn.configure(state="disabled")
         threading.Thread(
             target=self._delete_worker, args=(selected,), daemon=True
@@ -952,18 +990,18 @@ class HiDockApp(ctk.CTk):
         self._set_progress_mode(indeterminate=True)
 
         self._set_status("Loading Whisper on NPU (QNN)...")
-        self.after(0, lambda: self.model_label.configure(text="Model: loading (NPU)..."))
+        self.after(0, lambda: self.model_label.configure(text="Loading Whisper-Large-V3-Turbo..."))
         try:
             self.npu_sessions = transcribe_npu.load_sessions()
             self.tokenizer = transcribe_npu.load_tokenizer()
             self.after(0, lambda: self.model_label.configure(
-                text="Model: loaded (NPU)", text_color=CLR_GREEN
+                text="Whisper-Large-V3-Turbo (NPU)", text_color=CLR_GREEN
             ))
             return True
         except Exception as e:
             self._set_status(f"Failed to load Whisper: {e}")
             self.after(0, lambda: self.model_label.configure(
-                text="Model: error", text_color=CLR_RED
+                text="Model load error", text_color=CLR_RED
             ))
             return False
 
