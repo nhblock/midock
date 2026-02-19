@@ -69,86 +69,118 @@ def parse_file_datetime(f_info):
 # NPU utilization chart
 # ---------------------------------------------------------------------------
 
-class NpuChart(tk.Canvas):
-    """Rolling line chart showing NPU utilization percentage per chunk."""
+# ---------------------------------------------------------------------------
+# Color palette (Vertdure)
+# ---------------------------------------------------------------------------
 
-    HISTORY = 60
-    BG = "#1a1a2e"
-    LINE_COLOR = "#00d4ff"
-    FILL_COLOR = "#002244"
-    GRID_COLOR = "#2a2a4e"
-    LABEL_COLOR = "#667"
+CLR_GREEN        = "#61BF36"   # primary buttons, accents
+CLR_GREEN_DARK   = "#3A591B"   # sidebar bg, section headers
+CLR_GREEN_DEEP   = "#1e2e12"   # main panel bg
+CLR_YELLOW       = "#F2E205"   # highlight accent
+CLR_GOLD         = "#F2CB05"   # secondary accent
+CLR_AMBER        = "#D9961A"   # delete / warning
+CLR_BG_DARK      = "#141c0c"   # darkest background
+CLR_BG_PANEL     = "#1a2410"   # main panel background
+CLR_HEADER       = "#2a3a18"   # section header bars
+CLR_SEP          = "#3A591B"   # separator lines
+CLR_TEXT         = "#e8f0e0"   # primary text
+CLR_TEXT_DIM     = "#8a9a78"   # secondary / muted text
+CLR_TEXT_BRIGHT  = "#ffffff"   # bright text
+CLR_RED          = "#c04030"   # error text
+
+
+class NpuChart(tk.Canvas):
+    """Scrolling bar-chart activity monitor for NPU inference steps.
+
+    Fixed-width bars anchored to the right edge — new bars scroll in from
+    the right and old ones exit on the left, giving a continuous EKG feel.
+    """
+
+    BAR_W = 4              # fixed px width per bar
+    BAR_GAP = 1            # px between bars
+    BG = CLR_BG_DARK
+    BAR_COLOR = CLR_GREEN
+    BAR_ENCODER = CLR_YELLOW
+    BAR_DIM = "#2a4018"
+    REDRAW_MS = 40         # throttle: max ~25 fps
 
     def __init__(self, master, **kwargs):
         kwargs.setdefault("bg", self.BG)
         kwargs.setdefault("highlightthickness", 0)
+        kwargs.setdefault("height", 40)
         super().__init__(master, **kwargs)
+        # Each sample: (time_ms, is_encoder)
         self.data = []
-        self.bind("<Configure>", lambda e: self._redraw())
+        self._redraw_pending = False
+        self.bind("<Configure>", lambda e: self._schedule_redraw())
 
-    def add_sample(self, pct):
-        self.data.append(max(0.0, min(100.0, pct)))
-        if len(self.data) > self.HISTORY:
-            self.data = self.data[-self.HISTORY:]
-        self._redraw()
+    def add_sample(self, time_ms, is_encoder=False):
+        self.data.append((max(0.01, time_ms), is_encoder))
+        # Trim to max bars that could ever fit on screen (generous limit)
+        max_bars = max(400, self.winfo_width() // (self.BAR_W + self.BAR_GAP) + 10)
+        if len(self.data) > max_bars:
+            self.data = self.data[-max_bars:]
+        self._schedule_redraw()
 
     def clear(self):
         self.data.clear()
-        self._redraw()
+        self._schedule_redraw()
 
-    def _redraw(self):
+    def _schedule_redraw(self):
+        if not self._redraw_pending:
+            self._redraw_pending = True
+            self.after(self.REDRAW_MS, self._do_redraw)
+
+    def _do_redraw(self):
+        self._redraw_pending = False
         self.delete("all")
         w = self.winfo_width()
         h = self.winfo_height()
-        if w < 10 or h < 10:
+        if w < 4 or h < 4 or not self.data:
             return
 
-        pad_l, pad_r, pad_t, pad_b = 30, 6, 6, 6
-        cw = w - pad_l - pad_r
-        ch = h - pad_t - pad_b
+        pad = 2
+        cw = w - pad * 2
+        ch = h - pad * 2
+        step = self.BAR_W + self.BAR_GAP
+        max_visible = cw // step
 
-        # Grid lines at 25/50/75/100%
-        for pct in (25, 50, 75, 100):
-            y = pad_t + ch * (1 - pct / 100)
-            self.create_line(pad_l, y, w - pad_r, y, fill=self.GRID_COLOR)
-            self.create_text(
-                pad_l - 4, y, text=f"{pct}%", anchor="e",
-                fill=self.LABEL_COLOR, font=("Consolas", 8)
-            )
-
-        if not self.data:
-            self.create_text(
-                w // 2, h // 2, text="No data", fill=self.LABEL_COLOR,
-                font=("Consolas", 10)
-            )
+        # Take only the most recent bars that fit
+        visible = self.data[-max_visible:] if len(self.data) > max_visible else self.data
+        n = len(visible)
+        if n == 0:
             return
 
-        n = len(self.data)
-        if n == 1:
-            pts = [(pad_l + cw / 2, pad_t + ch * (1 - self.data[0] / 100))]
-        else:
-            pts = []
-            for i, v in enumerate(self.data):
-                x = pad_l + (i / (n - 1)) * cw
-                y = pad_t + ch * (1 - v / 100)
-                pts.append((x, y))
+        # Normalize decoder bars among themselves (encoder is always full-height)
+        dec_times = [t for t, enc in visible if not enc]
+        max_dec_ms = max(dec_times) if dec_times else 1.0
 
-        # Filled area
-        fill_pts = [pts[0]] + pts + [pts[-1]]
-        fill_pts[0] = (pts[0][0], pad_t + ch)
-        fill_pts[-1] = (pts[-1][0], pad_t + ch)
-        flat = [c for pt in fill_pts for c in pt]
-        self.create_polygon(flat, fill=self.FILL_COLOR, outline="")
+        # Draw right-aligned: newest bar flush with the right edge
+        right_edge = pad + cw
+        y_bottom = pad + ch
 
-        # Line
-        if len(pts) >= 2:
-            flat_line = [c for pt in pts for c in pt]
-            self.create_line(flat_line, fill=self.LINE_COLOR, width=2, smooth=True)
+        for i, (ms, is_enc) in enumerate(visible):
+            x1 = right_edge - (n - 1 - i) * step
+            x0 = x1 - self.BAR_W
+
+            if is_enc:
+                # Encoder: full-height yellow spike
+                bar_h = ch
+                color = self.BAR_ENCODER
+            else:
+                # Decoder: normalize to decoder-only max, floor at 15%
+                frac = ms / max_dec_ms if max_dec_ms > 0 else 0.5
+                bar_h = max(ch * 0.15, ch * frac)
+                age = (n - 1 - i) / max(n - 1, 1)
+                color = self.BAR_DIM if age > 0.7 else self.BAR_COLOR
+
+            y0 = y_bottom - bar_h
+            self.create_rectangle(x0, y0, x1, y_bottom, fill=color, outline="")
 
 
 # Column widths shared by header and rows
-# col 0=checkbox(28), 1=name(flex), 2=size(72), 3=duration(90), 4=date(160), 5=mode(50), 6=status(40)
-_COL_WIDTHS = {2: 72, 3: 90, 4: 160, 5: 50, 6: 40}
+# col 0=checkbox(28), 1=name(flex), 2=size(72), 3=duration(90), 4=date(160), 5=mode(62), 6=dl(36)
+_COL_WIDTHS = {2: 72, 3: 90, 4: 160, 5: 62, 6: 36}
 _MONO = ("Consolas", 13)
 
 
@@ -201,15 +233,15 @@ class FileRow(ctk.CTkFrame):
             font=font, width=_COL_WIDTHS[5]
         ).grid(row=0, column=5, padx=4, pady=2)
 
-        self.status_label = ctk.CTkLabel(
-            self, text="", anchor="e",
+        self.dl_label = ctk.CTkLabel(
+            self, text="", anchor="center",
             font=ctk.CTkFont(size=12), width=_COL_WIDTHS[6]
         )
-        self.status_label.grid(row=0, column=6, padx=(0, 8), pady=2)
+        self.dl_label.grid(row=0, column=6, padx=(0, 8), pady=2)
 
     def mark_downloaded(self, path):
         self.downloaded_path = path
-        self.status_label.configure(text="[mp3]", text_color="#4CAF50")
+        self.dl_label.configure(text="[yes]", text_color=CLR_GREEN)
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +253,8 @@ class HiDockApp(ctk.CTk):
         super().__init__()
 
         self.title("HiDock P1")
-        self.geometry("1100x700")
-        self.minsize(900, 500)
+        self.geometry("1150x900")
+        self.minsize(950, 520)
 
         # State
         self.dev = None
@@ -240,6 +272,9 @@ class HiDockApp(ctk.CTk):
 
         self._build_ui()
 
+        # Auto-connect to device on launch
+        self.after(100, self._start_connect)
+
     # -----------------------------------------------------------------------
     # UI construction
     # -----------------------------------------------------------------------
@@ -249,118 +284,153 @@ class HiDockApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # --- Sidebar ---
-        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0,
+                                     fg_color=CLR_GREEN_DARK)
         self.sidebar.grid(row=0, column=0, sticky="nswe")
         self.sidebar.grid_propagate(False)
 
+        btn_font = ctk.CTkFont(size=14, weight="bold")
+        btn_h = 38
+        btn_pad = 5
+        btn_radius = 10
+
         self.title_label = ctk.CTkLabel(
             self.sidebar, text="HiDock P1",
-            font=ctk.CTkFont(size=20, weight="bold")
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color=CLR_TEXT_BRIGHT
         )
-        self.title_label.pack(padx=16, pady=(20, 4))
+        self.title_label.pack(padx=20, pady=(20, 2))
 
         self.subtitle_label = ctk.CTkLabel(
             self.sidebar, text="USB Recording Manager",
-            font=ctk.CTkFont(size=12), text_color="gray"
+            font=ctk.CTkFont(size=13), text_color=CLR_TEXT_DIM
         )
-        self.subtitle_label.pack(padx=16, pady=(0, 16))
+        self.subtitle_label.pack(padx=20, pady=(0, 16))
 
         self.connect_btn = ctk.CTkButton(
-            self.sidebar, text="Connect", command=self._on_connect
+            self.sidebar, text="Connect", command=self._on_connect,
+            fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
+            font=btn_font, height=btn_h, corner_radius=btn_radius
         )
-        self.connect_btn.pack(padx=16, pady=4, fill="x")
+        self.connect_btn.pack(padx=20, pady=btn_pad, fill="x")
 
         # Device info area
         self.info_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.info_frame.pack(padx=16, pady=(12, 4), fill="x")
+        self.info_frame.pack(padx=20, pady=(10, 4), fill="x")
 
-        self.fw_label = ctk.CTkLabel(
-            self.info_frame, text="", anchor="w",
-            font=ctk.CTkFont(size=12)
-        )
-        self.fw_label.pack(fill="x")
+        info_font = ctk.CTkFont(size=12)
+        for attr in ("fw_label", "serial_label", "battery_label",
+                      "storage_label", "files_label"):
+            lbl = ctk.CTkLabel(self.info_frame, text="", anchor="w",
+                               font=info_font, text_color=CLR_TEXT)
+            lbl.pack(fill="x")
+            setattr(self, attr, lbl)
 
-        self.serial_label = ctk.CTkLabel(
-            self.info_frame, text="", anchor="w",
-            font=ctk.CTkFont(size=12)
-        )
-        self.serial_label.pack(fill="x")
-
-        self.battery_label = ctk.CTkLabel(
-            self.info_frame, text="", anchor="w",
-            font=ctk.CTkFont(size=12)
-        )
-        self.battery_label.pack(fill="x")
-
-        sep = ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30")
-        sep.pack(padx=16, pady=12, fill="x")
+        sep = ctk.CTkFrame(self.sidebar, height=1, fg_color=CLR_SEP)
+        sep.pack(padx=20, pady=10, fill="x")
 
         self.dl_selected_btn = ctk.CTkButton(
             self.sidebar, text="Download Selected",
-            command=self._on_download_selected, state="disabled"
+            command=self._on_download_selected, state="disabled",
+            fg_color="#89d466", hover_color="#4ea02a", text_color=CLR_GREEN_DARK,
+            font=btn_font, height=btn_h, corner_radius=btn_radius
         )
-        self.dl_selected_btn.pack(padx=16, pady=4, fill="x")
+        self.dl_selected_btn.pack(padx=20, pady=btn_pad, fill="x")
 
         self.dl_all_btn = ctk.CTkButton(
             self.sidebar, text="Download All",
-            command=self._on_download_all, state="disabled"
+            command=self._on_download_all, state="disabled",
+            fg_color="#89d466", hover_color="#4ea02a", text_color=CLR_GREEN_DARK,
+            font=btn_font, height=btn_h, corner_radius=btn_radius
         )
-        self.dl_all_btn.pack(padx=16, pady=4, fill="x")
+        self.dl_all_btn.pack(padx=20, pady=btn_pad, fill="x")
 
-        sep2 = ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30")
-        sep2.pack(padx=16, pady=12, fill="x")
+        self.delete_btn = ctk.CTkButton(
+            self.sidebar, text="Delete Selected",
+            command=self._on_delete_selected, state="disabled",
+            fg_color="#e6be6a", hover_color="#c07a10", text_color="#6b4a0d",
+            font=btn_font, height=btn_h, corner_radius=btn_radius
+        )
+        self.delete_btn.pack(padx=20, pady=btn_pad, fill="x")
+
+        sep2 = ctk.CTkFrame(self.sidebar, height=1, fg_color=CLR_SEP)
+        sep2.pack(padx=20, pady=10, fill="x")
 
         self.transcribe_btn = ctk.CTkButton(
             self.sidebar, text="Transcribe",
-            command=self._on_transcribe, state="disabled"
+            command=self._on_transcribe, state="disabled",
+            fg_color="#f5ee6e", hover_color=CLR_GOLD, text_color="#6b6b04",
+            font=btn_font, height=btn_h, corner_radius=btn_radius
         )
-        self.transcribe_btn.pack(padx=16, pady=4, fill="x")
+        self.transcribe_btn.pack(padx=20, pady=btn_pad, fill="x")
 
         self.model_label = ctk.CTkLabel(
             self.sidebar, text="Model: not loaded",
-            font=ctk.CTkFont(size=11), text_color="gray"
+            font=ctk.CTkFont(size=11), text_color=CLR_TEXT_DIM
         )
-        self.model_label.pack(padx=16, pady=(4, 8))
+        self.model_label.pack(padx=20, pady=(4, 8))
 
-        sep3 = ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30")
-        sep3.pack(padx=16, pady=12, fill="x")
+        sep3 = ctk.CTkFrame(self.sidebar, height=1, fg_color=CLR_SEP)
+        sep3.pack(padx=20, pady=10, fill="x")
 
         self.dl_dir_btn = ctk.CTkButton(
             self.sidebar, text="Download Folder...",
-            command=self._on_choose_download_dir
+            command=self._on_choose_download_dir,
+            fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
+            font=btn_font, height=btn_h, corner_radius=btn_radius
         )
-        self.dl_dir_btn.pack(padx=16, pady=4, fill="x")
+        self.dl_dir_btn.pack(padx=20, pady=btn_pad, fill="x")
 
         self.dl_dir_label = ctk.CTkLabel(
             self.sidebar, text=self._format_config_dir("download_dir"),
-            font=ctk.CTkFont(size=11), text_color="gray", wraplength=190
+            font=ctk.CTkFont(size=11), text_color=CLR_TEXT_DIM, wraplength=210
         )
-        self.dl_dir_label.pack(padx=16, pady=(2, 4))
+        self.dl_dir_label.pack(padx=20, pady=(2, 4))
 
         self.output_dir_btn = ctk.CTkButton(
             self.sidebar, text="Transcript Folder...",
-            command=self._on_choose_output_dir
+            command=self._on_choose_output_dir,
+            fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
+            font=btn_font, height=btn_h, corner_radius=btn_radius
         )
-        self.output_dir_btn.pack(padx=16, pady=4, fill="x")
+        self.output_dir_btn.pack(padx=20, pady=btn_pad, fill="x")
 
         self.output_dir_label = ctk.CTkLabel(
             self.sidebar, text=self._format_config_dir("transcript_output_dir"),
-            font=ctk.CTkFont(size=11), text_color="gray", wraplength=190
+            font=ctk.CTkFont(size=11), text_color=CLR_TEXT_DIM, wraplength=210
         )
-        self.output_dir_label.pack(padx=16, pady=(2, 8))
+        self.output_dir_label.pack(padx=20, pady=(2, 8))
 
         # --- Main panel ---
-        self.main_panel = ctk.CTkFrame(self, corner_radius=0)
+        self.main_panel = ctk.CTkFrame(self, corner_radius=0,
+                                        fg_color=CLR_BG_PANEL)
         self.main_panel.grid(row=0, column=1, sticky="nswe")
-        self.main_panel.grid_rowconfigure(0, weight=3)  # file list
-        # row 1 = progress (no weight)
-        self.main_panel.grid_rowconfigure(2, weight=1)  # NPU chart
-        self.main_panel.grid_rowconfigure(3, weight=2)  # transcript
+        self.main_panel.grid_rowconfigure(0, weight=5)  # file list (~60%)
+        # row 1 = progress (fixed)
+        self.main_panel.grid_rowconfigure(2, weight=3)  # transcript (~40%)
+        # row 3 = NPU chart (fixed height strip)
         self.main_panel.grid_columnconfigure(0, weight=1)
 
-        # File list header with column labels + sort buttons
-        header_frame = ctk.CTkFrame(self.main_panel, height=30, fg_color="gray20", corner_radius=0)
-        header_frame.grid(row=0, column=0, sticky="nwe", padx=0, pady=0)
+        # File list container: header + scrollable area stacked
+        file_container = ctk.CTkFrame(self.main_panel, fg_color="transparent")
+        file_container.grid(row=0, column=0, sticky="nswe", padx=0, pady=0)
+        file_container.grid_rowconfigure(1, weight=1)
+        file_container.grid_columnconfigure(0, weight=1)
+
+        # File list scrollable area (create first to measure internal offset)
+        self.file_list_frame = ctk.CTkScrollableFrame(
+            file_container, fg_color="transparent"
+        )
+        self.file_list_frame.grid(row=1, column=0, sticky="nswe", padx=0, pady=0)
+        self.file_list_frame.grid_columnconfigure(0, weight=1)
+
+        # Header — padx matches scrollable frame's internal border + scrollbar
+        # CTkScrollableFrame has ~3px left border; scrollbar ~14px on right
+        hdr_pad_l = 3
+        hdr_pad_r = 17
+        header_frame = ctk.CTkFrame(file_container, height=30,
+                                     fg_color=CLR_HEADER, corner_radius=0)
+        header_frame.grid(row=0, column=0, sticky="nwe", padx=(hdr_pad_l, hdr_pad_r), pady=0)
         header_frame.grid_propagate(False)
         header_frame.grid_columnconfigure(1, weight=1)
 
@@ -371,52 +441,46 @@ class HiDockApp(ctk.CTk):
         ctk.CTkLabel(header_frame, text="", width=28).grid(row=0, column=0, padx=(4, 0))
 
         ctk.CTkLabel(
-            header_frame, text="Name", anchor="w", font=hdr_font
+            header_frame, text="Name", anchor="w", font=hdr_font,
+            text_color=CLR_TEXT
         ).grid(row=0, column=1, padx=(4, 4), pady=4, sticky="w")
 
         ctk.CTkLabel(
             header_frame, text="Size", anchor="e",
-            font=hdr_font, width=_COL_WIDTHS[2]
+            font=hdr_font, width=_COL_WIDTHS[2], text_color=CLR_TEXT
         ).grid(row=0, column=2, padx=4, pady=4)
 
         self.sort_dur_btn = ctk.CTkButton(
             header_frame, text="Length v", width=_COL_WIDTHS[3], height=22,
-            font=sort_font, fg_color="transparent", text_color="white",
-            hover_color="gray30", anchor="e",
+            font=sort_font, fg_color="transparent", text_color=CLR_YELLOW,
+            hover_color=CLR_GREEN_DARK, anchor="e",
             command=lambda: self._toggle_sort("duration")
         )
         self.sort_dur_btn.grid(row=0, column=3, padx=4, pady=3)
 
         self.sort_date_btn = ctk.CTkButton(
             header_frame, text="Date v", width=_COL_WIDTHS[4], height=22,
-            font=sort_font, fg_color="transparent", text_color="white",
-            hover_color="gray30", anchor="w",
+            font=sort_font, fg_color="transparent", text_color=CLR_YELLOW,
+            hover_color=CLR_GREEN_DARK, anchor="w",
             command=lambda: self._toggle_sort("date")
         )
         self.sort_date_btn.grid(row=0, column=4, padx=4, pady=3)
 
         ctk.CTkLabel(
             header_frame, text="Mode", anchor="w",
-            font=hdr_font, width=_COL_WIDTHS[5]
+            font=hdr_font, width=_COL_WIDTHS[5], text_color=CLR_TEXT
         ).grid(row=0, column=5, padx=4, pady=4)
 
-        # Status column spacer
-        ctk.CTkLabel(header_frame, text="", width=_COL_WIDTHS[6]).grid(
-            row=0, column=6, padx=(0, 8)
-        )
-
-        # File list scrollable area
-        self.file_list_frame = ctk.CTkScrollableFrame(
-            self.main_panel, fg_color="transparent"
-        )
-        self.file_list_frame.grid(row=0, column=0, sticky="nswe", padx=0, pady=(30, 0))
-        self.file_list_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header_frame, text="DL", anchor="center",
+            font=hdr_font, width=_COL_WIDTHS[6], text_color=CLR_TEXT
+        ).grid(row=0, column=6, padx=(0, 8), pady=4)
 
         # Placeholder when no files
         self.placeholder_label = ctk.CTkLabel(
             self.file_list_frame,
             text="Connect a device to view recordings",
-            text_color="gray", font=ctk.CTkFont(size=14)
+            text_color=CLR_TEXT_DIM, font=ctk.CTkFont(size=14)
         )
         self.placeholder_label.pack(pady=40)
 
@@ -427,42 +491,51 @@ class HiDockApp(ctk.CTk):
 
         self.status_label = ctk.CTkLabel(
             self.progress_frame, text="Ready", anchor="w",
-            font=ctk.CTkFont(size=12)
+            font=ctk.CTkFont(size=12), text_color=CLR_TEXT
         )
         self.status_label.grid(row=0, column=0, sticky="w")
 
-        self.progress_bar = ctk.CTkProgressBar(self.progress_frame)
+        self.progress_bar = ctk.CTkProgressBar(self.progress_frame,
+                                                 progress_color=CLR_GREEN)
         self.progress_bar.grid(row=1, column=0, sticky="we", pady=(2, 0))
         self.progress_bar.set(0)
 
-        # NPU utilization chart
-        npu_header = ctk.CTkFrame(self.main_panel, height=30, fg_color="gray20", corner_radius=0)
-        npu_header.grid(row=2, column=0, sticky="nwe", padx=0, pady=0)
-        npu_header.grid_propagate(False)
-        npu_label = ctk.CTkLabel(
-            npu_header, text="  NPU Utilization",
-            anchor="w", font=ctk.CTkFont(size=13, weight="bold")
-        )
-        npu_label.pack(fill="x", padx=8, pady=4)
-
-        self.npu_chart = NpuChart(self.main_panel)
-        self.npu_chart.grid(row=2, column=0, sticky="nswe", padx=0, pady=(30, 0))
-
         # Transcription output
-        transcript_header = ctk.CTkFrame(self.main_panel, height=30, fg_color="gray20", corner_radius=0)
-        transcript_header.grid(row=3, column=0, sticky="nwe", padx=0, pady=0)
+        transcript_header = ctk.CTkFrame(self.main_panel, height=30,
+                                          fg_color=CLR_HEADER, corner_radius=0)
+        transcript_header.grid(row=2, column=0, sticky="nwe", padx=0, pady=0)
         transcript_header.grid_propagate(False)
         transcript_label = ctk.CTkLabel(
             transcript_header, text="  Transcription Output",
-            anchor="w", font=ctk.CTkFont(size=13, weight="bold")
+            anchor="w", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=CLR_TEXT
         )
         transcript_label.pack(fill="x", padx=8, pady=4)
 
         self.transcript_box = ctk.CTkTextbox(
             self.main_panel, state="disabled",
-            font=ctk.CTkFont(family="Consolas", size=13)
+            font=ctk.CTkFont(family="Consolas", size=13),
+            fg_color=CLR_GREEN_DEEP, text_color=CLR_TEXT
         )
-        self.transcript_box.grid(row=3, column=0, sticky="nswe", padx=0, pady=(30, 0))
+        self.transcript_box.grid(row=2, column=0, sticky="nswe", padx=0, pady=(30, 0))
+
+        # NPU utilization strip (compact fixed-height sparkline)
+        npu_frame = ctk.CTkFrame(self.main_panel, height=60,
+                                  fg_color=CLR_BG_DARK, corner_radius=0)
+        npu_frame.grid(row=3, column=0, sticky="swe", padx=0, pady=0)
+        npu_frame.grid_propagate(False)
+        npu_frame.grid_columnconfigure(0, weight=1)
+        npu_frame.grid_rowconfigure(1, weight=1)
+
+        npu_label = ctk.CTkLabel(
+            npu_frame, text="  NPU", anchor="w",
+            font=ctk.CTkFont(size=10), text_color=CLR_TEXT_DIM,
+            fg_color="transparent"
+        )
+        npu_label.grid(row=0, column=0, sticky="w", padx=4, pady=(2, 0))
+
+        self.npu_chart = NpuChart(npu_frame, height=38)
+        self.npu_chart.grid(row=1, column=0, sticky="nswe", padx=2, pady=(0, 2))
 
     # -----------------------------------------------------------------------
     # UI helpers
@@ -495,10 +568,18 @@ class HiDockApp(ctk.CTk):
 
     def _set_buttons_state(self, connected=False, has_downloads=False):
         def _apply():
-            state_conn = "normal" if connected else "disabled"
-            self.dl_selected_btn.configure(state=state_conn)
-            self.dl_all_btn.configure(state=state_conn)
-            self.transcribe_btn.configure(state="normal" if has_downloads else "disabled")
+            if connected:
+                for btn in (self.dl_selected_btn, self.dl_all_btn):
+                    btn.configure(state="normal", fg_color=CLR_GREEN, text_color=CLR_TEXT_BRIGHT)
+                self.delete_btn.configure(state="normal", fg_color=CLR_AMBER, text_color=CLR_TEXT_BRIGHT)
+            else:
+                for btn in (self.dl_selected_btn, self.dl_all_btn):
+                    btn.configure(state="disabled", fg_color="#89d466", text_color=CLR_GREEN_DARK)
+                self.delete_btn.configure(state="disabled", fg_color="#e6be6a", text_color="#6b4a0d")
+            if has_downloads:
+                self.transcribe_btn.configure(state="normal", fg_color=CLR_YELLOW, text_color=CLR_GREEN_DARK)
+            else:
+                self.transcribe_btn.configure(state="disabled", fg_color="#f5ee6e", text_color="#6b6b04")
         self.after(0, _apply)
 
     def _populate_device_info(self):
@@ -510,7 +591,24 @@ class HiDockApp(ctk.CTk):
                 self.battery_label.configure(
                     text=f"Bat: {self.battery_info['battery']}% ({self.battery_info['status']})"
                 )
+            self._update_storage_info()
         self.after(0, _apply)
+
+    def _update_storage_info(self):
+        """Update storage and file count labels from self.files."""
+        TOTAL_BYTES = 16 * 1024 * 1024 * 1024  # 16 GB
+        if self.files:
+            used = sum(f["size"] for f in self.files)
+            used_mb = used / (1024 * 1024)
+            total_mb = TOTAL_BYTES / (1024 * 1024)
+            pct = used / TOTAL_BYTES * 100
+            self.storage_label.configure(
+                text=f"Storage: {used_mb:.0f}/{total_mb:.0f} MB ({pct:.1f}%)"
+            )
+            self.files_label.configure(text=f"Files: {len(self.files)}")
+        else:
+            self.storage_label.configure(text="")
+            self.files_label.configure(text="")
 
     def _populate_file_list(self):
         def _apply():
@@ -616,6 +714,9 @@ class HiDockApp(ctk.CTk):
         if self.dev is not None:
             self._disconnect()
             return
+        self._start_connect()
+
+    def _start_connect(self):
         self.connect_btn.configure(state="disabled", text="Connecting...")
         self._set_status("Connecting to device...")
         self._set_progress_mode(indeterminate=True)
@@ -623,6 +724,15 @@ class HiDockApp(ctk.CTk):
 
     def _connect_worker(self):
         try:
+            # Clean up any stale handle (e.g. device was power-cycled)
+            if self.dev is not None:
+                with self.usb_lock:
+                    try:
+                        hidock_p1.close_device(self.dev)
+                    except Exception:
+                        pass
+                    self.dev = None
+
             with self.usb_lock:
                 dev = hidock_p1.open_device()
                 info = hidock_p1.get_device_info(dev)
@@ -644,6 +754,7 @@ class HiDockApp(ctk.CTk):
                 state="normal", text="Disconnect"
             ))
         except Exception as e:
+            self.dev = None
             self._set_status(f"Connection failed: {e}")
             self._set_progress_mode(indeterminate=False)
             self.after(0, lambda: self.connect_btn.configure(
@@ -665,6 +776,8 @@ class HiDockApp(ctk.CTk):
         self.fw_label.configure(text="")
         self.serial_label.configure(text="")
         self.battery_label.configure(text="")
+        self.storage_label.configure(text="")
+        self.files_label.configure(text="")
         self._populate_file_list()
         self._set_buttons_state(connected=False)
         self.connect_btn.configure(text="Connect")
@@ -765,14 +878,69 @@ class HiDockApp(ctk.CTk):
         ))
 
     # -----------------------------------------------------------------------
+    # Delete
+    # -----------------------------------------------------------------------
+
+    def _on_delete_selected(self):
+        selected = [r for r in self.file_rows if r.selected.get()]
+        if not selected:
+            self._set_status("No files selected")
+            return
+        names = [r.file_info["name"] for r in selected]
+        msg = f"Delete {len(names)} file(s) from device?\n\n" + "\n".join(names)
+        from tkinter import messagebox
+        if not messagebox.askyesno("Confirm Delete", msg, parent=self):
+            return
+        self.delete_btn.configure(state="disabled")
+        self.dl_selected_btn.configure(state="disabled")
+        self.dl_all_btn.configure(state="disabled")
+        self.connect_btn.configure(state="disabled")
+        threading.Thread(
+            target=self._delete_worker, args=(selected,), daemon=True
+        ).start()
+
+    def _delete_worker(self, rows):
+        total = len(rows)
+        deleted = 0
+        for idx, row in enumerate(rows, 1):
+            name = row.file_info["name"]
+            self._set_status(f"Deleting {idx}/{total}: {name}")
+            self._set_progress(idx / total)
+            try:
+                with self.usb_lock:
+                    result = hidock_p1.delete_file(self.dev, name)
+                if result == "success":
+                    deleted += 1
+                    self.files = [f for f in self.files if f["name"] != name]
+                else:
+                    self._set_status(f"Delete {name}: {result}")
+            except Exception as e:
+                self._set_status(f"Delete failed ({name}): {e}")
+
+        self._set_progress(1.0)
+        self._set_status(f"Deleted {deleted}/{total} file(s) from device")
+        self._populate_file_list()
+        self.after(0, self._update_storage_info)
+        self.after(10, self._check_existing_downloads)
+        self.after(0, lambda: self.connect_btn.configure(
+            state="normal", text="Disconnect" if self.dev else "Connect"
+        ))
+        has_downloads = any(r.downloaded_path for r in self.file_rows)
+        self.after(20, lambda: self._set_buttons_state(
+            connected=self.dev is not None, has_downloads=has_downloads
+        ))
+
+    # -----------------------------------------------------------------------
     # Transcription
     # -----------------------------------------------------------------------
 
     def _on_transcribe(self):
-        downloaded = [r for r in self.file_rows if r.downloaded_path is not None]
-        if not downloaded:
-            self._set_status("No downloaded files to transcribe")
+        selected = [r for r in self.file_rows
+                    if r.selected.get() and r.downloaded_path is not None]
+        if not selected:
+            self._set_status("No selected files with downloads to transcribe")
             return
+        downloaded = selected
         self.transcribe_btn.configure(state="disabled")
         threading.Thread(
             target=self._transcribe_worker, args=(downloaded,), daemon=True
@@ -789,21 +957,21 @@ class HiDockApp(ctk.CTk):
             self.npu_sessions = transcribe_npu.load_sessions()
             self.tokenizer = transcribe_npu.load_tokenizer()
             self.after(0, lambda: self.model_label.configure(
-                text="Model: loaded (NPU)", text_color="#4CAF50"
+                text="Model: loaded (NPU)", text_color=CLR_GREEN
             ))
             return True
         except Exception as e:
             self._set_status(f"Failed to load Whisper: {e}")
             self.after(0, lambda: self.model_label.configure(
-                text="Model: error", text_color="#F44336"
+                text="Model: error", text_color=CLR_RED
             ))
             return False
 
-    def _transcribe_file(self, mp3_path, chunk_callback=None):
+    def _transcribe_file(self, mp3_path, chunk_callback=None, step_callback=None):
         """Transcribe a single file on the NPU."""
         return transcribe_npu.transcribe(
             self.npu_sessions, self.tokenizer, mp3_path,
-            chunk_callback=chunk_callback
+            chunk_callback=chunk_callback, step_callback=step_callback
         )
 
     def _transcribe_worker(self, rows):
@@ -842,13 +1010,16 @@ class HiDockApp(ctk.CTk):
                     f"Transcribing {idx}/{total}: {filename} — "
                     f"{fmt_mmss(current_s)} of {fmt_mmss(total_audio_s)}"
                 )
-                wall = info["wall_time_s"]
-                if wall > 0:
-                    npu_pct = (info["encoder_time_s"] + info["decoder_time_s"]) / wall * 100
-                    self.after(0, lambda p=npu_pct: self.npu_chart.add_sample(p))
+
+            def on_step(step_info):
+                ms = step_info["run_time_ms"]
+                is_enc = step_info["phase"] == "encoder"
+                self.after(0, lambda: self.npu_chart.add_sample(ms, is_enc))
 
             try:
-                text = self._transcribe_file(mp3_path, chunk_callback=on_chunk)
+                text = self._transcribe_file(
+                    mp3_path, chunk_callback=on_chunk, step_callback=on_step
+                )
                 self._append_transcript(f"\n--- {filename} ---\n{text}\n")
 
                 # Save transcript to disk if output dir configured

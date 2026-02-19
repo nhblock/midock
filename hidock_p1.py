@@ -29,6 +29,7 @@ import usb.util
 import struct
 import sys
 import os
+import re
 import time
 import argparse
 import platform
@@ -183,6 +184,10 @@ def close_device(dev):
         dev.attach_kernel_driver(INTERFACE)  # Linux only
     except (NotImplementedError, Exception):
         pass
+    try:
+        usb.util.dispose_resources(dev)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Low-level send/receive
@@ -324,24 +329,28 @@ def _parse_file_list_body(data: bytes):
         name = "".join(name_chars)
 
         # Compute duration from version + size (mirrors JS logic)
-        duration = 0
+        # JS computes duration in milliseconds; we convert to seconds at the end.
+        # Initial value depends on filename pattern:
+        is_hda = name.lower().endswith(('.hda', '.wav')) and not re.match(
+            r'^\d{14}REC\d+\.wav$', name, re.IGNORECASE)
+        duration_ms = (file_size / 32) * 4 if is_hda else file_size / 32
+
         if version == 1:
-            duration = file_size / 32 * 2
+            duration_ms = duration_ms * 2
         elif version == 2:
-            duration = (file_size - 44) / 48 / 2
+            duration_ms = (file_size - 44) / 48 / 2
         elif version == 3:
-            duration = (file_size - 44) / 48 / 2 / 2
+            duration_ms = (file_size - 44) / 48 / 2 / 2
         elif version == 5:
-            duration = file_size / 12
+            duration_ms = file_size / 12
         elif version == 6:
-            duration = file_size / 16
+            duration_ms = file_size / 16
         elif version == 7:
-            duration = file_size / 10
-        else:
-            duration = file_size / 32
+            duration_ms = file_size / 10
+
+        duration = duration_ms / 1000  # ms -> seconds
 
         # Parse mode from filename
-        import re
         mode = "room"
         m = re.match(r'^(\w{9})-(\d{6})-(.+?)\d+\.\w+$', name, re.IGNORECASE)
         if m:
@@ -357,14 +366,13 @@ def _parse_file_list_body(data: bytes):
         date_str = ""
         time_str = ""
         dt = None
-        import re as _re
-        if _re.match(r'^\d{14}REC\d+\.wav$', name, re.IGNORECASE):
-            m2 = _re.match(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})REC', name)
+        if re.match(r'^\d{14}REC\d+\.wav$', name, re.IGNORECASE):
+            m2 = re.match(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})REC', name)
             if m2:
                 date_str = f"{m2.group(1)}/{m2.group(2)}/{m2.group(3)}"
                 time_str = f"{m2.group(4)}:{m2.group(5)}:{m2.group(6)}"
         else:
-            m3 = _re.match(r'^(\d{2})?(\d{2})(\w{3})(\d{2})-(\d{2})(\d{2})(\d{2})-.*\.(hda|wav)$', name, re.IGNORECASE)
+            m3 = re.match(r'^(\d{2})?(\d{2})(\w{3})(\d{2})-(\d{2})(\d{2})(\d{2})-.*\.(hda|wav)$', name, re.IGNORECASE)
             if m3:
                 yr  = m3.group(2)
                 mon = m3.group(3)
@@ -387,6 +395,21 @@ def _parse_file_list_body(data: bytes):
         })
 
     return files
+
+def delete_file(dev, filename: str):
+    """
+    Delete a file from the device (cmd 7).
+    Returns "success", "not-exists", or "failed".
+    """
+    body = bytes(ord(c) for c in filename)
+    _, rbody = send_recv(dev, CMD_DELETE_FILE, body, timeout_ms=5000)
+    if rbody and len(rbody) > 0:
+        code = rbody[0]
+        if code == 0:
+            return "success"
+        elif code == 1:
+            return "not-exists"
+    return "failed"
 
 def download_file(dev, filename: str, dest_path: str, file_size: int, progress_callback=None):
     """

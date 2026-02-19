@@ -244,7 +244,7 @@ def load_tokenizer():
 # ---------------------------------------------------------------------------
 
 def transcribe_chunk(encoder_sess, decoder_sess, tokenizer, mel,
-                     return_timing=False):
+                     return_timing=False, step_callback=None):
     """
     Transcribe one <=30 s mel spectrogram chunk.
 
@@ -253,6 +253,8 @@ def transcribe_chunk(encoder_sess, decoder_sess, tokenizer, mel,
         tokenizer: ``tokenizers.Tokenizer``.
         mel: (1, 128, 3000) float16.
         return_timing: if True, return (tokens, timing_dict) instead of tokens.
+        step_callback: optional callable(step_info_dict) invoked after each
+            decoder step (and once for the encoder) for fine-grained progress.
 
     Returns:
         list[int] — generated token IDs (special tokens filtered out).
@@ -264,6 +266,12 @@ def transcribe_chunk(encoder_sess, decoder_sess, tokenizer, mel,
     t_enc_end = time.time()
     enc_names = [o.name for o in encoder_sess.get_outputs()]
     cross = dict(zip(enc_names, enc_out))
+
+    if step_callback is not None:
+        step_callback({
+            "phase": "encoder",
+            "run_time_ms": (t_enc_end - t_enc_start) * 1000,
+        })
 
     # --- Decoder init ----------------------------------------------------
     k_self = [np.zeros((NUM_HEADS, 1, HEAD_DIM, MEAN_DECODE_LEN - 1),
@@ -297,7 +305,9 @@ def transcribe_chunk(encoder_sess, decoder_sess, tokenizer, mel,
             feed[f"k_cache_cross_{i}"]   = cross[f"k_cache_cross_{i}"]
             feed[f"v_cache_cross_{i}"]   = cross[f"v_cache_cross_{i}"]
 
+        t_step_start = time.time()
         outs = decoder_sess.run(None, feed)
+        t_step_end = time.time()
         out = dict(zip(dec_out_names, outs))
 
         # Update self KV caches
@@ -313,6 +323,14 @@ def transcribe_chunk(encoder_sess, decoder_sess, tokenizer, mel,
                     logits[t] = -np.inf
             next_tok = int(np.argmax(logits))
             generated.append(next_tok)
+
+            if step_callback is not None:
+                step_callback({
+                    "phase": "decoder",
+                    "step": step,
+                    "run_time_ms": (t_step_end - t_step_start) * 1000,
+                })
+
             if next_tok == EOT_TOKEN:
                 break
 
@@ -332,7 +350,8 @@ def transcribe_chunk(encoder_sess, decoder_sess, tokenizer, mel,
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def transcribe(sessions, tokenizer, audio_path, chunk_callback=None):
+def transcribe(sessions, tokenizer, audio_path, chunk_callback=None,
+               step_callback=None):
     """
     Transcribe an audio file end-to-end.
 
@@ -341,6 +360,8 @@ def transcribe(sessions, tokenizer, audio_path, chunk_callback=None):
         tokenizer: from ``load_tokenizer()``.
         audio_path: path to an audio file (mp3, wav, etc.).
         chunk_callback: optional callable(info_dict) invoked after each chunk.
+        step_callback: optional callable(step_info_dict) invoked per decoder
+            step for fine-grained NPU activity visualization.
 
     Returns:
         Transcribed text string.
@@ -362,7 +383,8 @@ def transcribe(sessions, tokenizer, audio_path, chunk_callback=None):
         mel = mel_spectrogram(chunk)
         t_wall_start = time.time()
         tokens, timing = transcribe_chunk(
-            encoder_sess, decoder_sess, tokenizer, mel, return_timing=True
+            encoder_sess, decoder_sess, tokenizer, mel, return_timing=True,
+            step_callback=step_callback,
         )
         wall_time_s = time.time() - t_wall_start
 
