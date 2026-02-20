@@ -2,7 +2,7 @@
 """
 diarize.py - Speaker diarization using ONNX models (CPU only).
 
-Pipeline: pyannote segmentation → wespeaker embedding → spectral clustering.
+Pipeline: pyannote segmentation → wespeaker embedding → agglomerative clustering.
 Runs entirely on CPU, keeping the NPU free for Whisper transcription.
 """
 
@@ -212,73 +212,79 @@ def run_segmentation(seg_sess, audio, step_callback=None):
     counts = np.maximum(counts, 1.0)
     activity = (activity_acc.T / counts).T.astype(np.float32)  # (total_frames, 3)
 
-    # Binarize
-    binary = (activity > BINARIZE_THRESHOLD).astype(np.int32)
-
-    # Convert frame-level binary labels to contiguous segments
-    segments = _frames_to_segments(binary, frame_duration, total_duration)
-
-    # Merge short segments
-    segments = _merge_short_segments(segments, MIN_SEGMENT_S)
+    # Convert frame-level activity to non-overlapping speaker turns.
+    # Each frame is assigned to the dominant active speaker (highest
+    # probability), or silence if no speaker exceeds the threshold.
+    segments = _activity_to_turns(activity, frame_duration, total_duration)
 
     return segments
 
 
-def _frames_to_segments(binary, frame_duration, total_duration):
-    """Convert (num_frames, 3) binary speaker activity to segment list.
+def _activity_to_turns(activity, frame_duration, total_duration):
+    """Convert frame-level speaker activity to non-overlapping speaker turns.
+
+    Each frame is assigned to the single speaker with highest activity
+    (above threshold), producing clean non-overlapping segments.
+
+    Args:
+        activity: (num_frames, 3) float32 speaker probabilities.
+        frame_duration: seconds per frame.
+        total_duration: total audio duration in seconds.
 
     Returns:
-        list of (start_s, end_s, local_speaker_id) sorted by start time.
+        list of (start_s, end_s, local_speaker_id) sorted by time.
     """
-    num_frames, num_speakers = binary.shape
+    num_frames = activity.shape[0]
+
+    # Assign each frame to dominant speaker (or -1 for silence)
+    labels = np.full(num_frames, -1, dtype=np.int32)
+    for f in range(num_frames):
+        a = activity[f]
+        max_spk = int(np.argmax(a))
+        if a[max_spk] > BINARIZE_THRESHOLD:
+            labels[f] = max_spk
+
+    # Extract contiguous runs of the same label
     segments = []
+    seg_start = 0
+    seg_label = labels[0]
 
-    for spk in range(num_speakers):
-        active = binary[:, spk]
-        in_segment = False
-        seg_start = 0
-
-        for f in range(num_frames):
-            if active[f] and not in_segment:
-                seg_start = f
-                in_segment = True
-            elif not active[f] and in_segment:
+    for f in range(1, num_frames):
+        if labels[f] != seg_label:
+            if seg_label >= 0:  # skip silence
                 start_s = seg_start * frame_duration
                 end_s = f * frame_duration
-                if end_s - start_s >= 0.1:  # skip tiny blips
-                    segments.append((start_s, end_s, spk))
-                in_segment = False
+                segments.append((start_s, end_s, int(seg_label)))
+            seg_start = f
+            seg_label = labels[f]
 
-        # Close any open segment
-        if in_segment:
-            start_s = seg_start * frame_duration
-            end_s = min(num_frames * frame_duration, total_duration)
-            if end_s - start_s >= 0.1:
-                segments.append((start_s, end_s, spk))
+    # Close final segment
+    if seg_label >= 0:
+        start_s = seg_start * frame_duration
+        end_s = min(num_frames * frame_duration, total_duration)
+        segments.append((start_s, end_s, int(seg_label)))
 
-    # Sort by start time
-    segments.sort(key=lambda s: s[0])
+    # Merge consecutive same-speaker segments separated by short silence
+    segments = _merge_nearby_same_speaker(segments, gap_threshold=1.0)
+
+    # Drop segments shorter than minimum
+    segments = [(s, e, spk) for s, e, spk in segments if e - s >= MIN_SEGMENT_S]
+
     return segments
 
 
-def _merge_short_segments(segments, min_duration):
-    """Merge segments shorter than min_duration with their nearest neighbor."""
+def _merge_nearby_same_speaker(segments, gap_threshold=1.0):
+    """Merge consecutive segments with the same speaker if the gap is small."""
     if len(segments) <= 1:
         return segments
 
-    merged = []
-    for seg in segments:
-        start, end, spk = seg
-        duration = end - start
-
-        if duration < min_duration and merged:
-            # Merge with previous segment if same speaker
-            prev_start, prev_end, prev_spk = merged[-1]
-            if prev_spk == spk:
-                merged[-1] = (prev_start, end, spk)
-                continue
-
-        merged.append(seg)
+    merged = [segments[0]]
+    for start, end, spk in segments[1:]:
+        prev_start, prev_end, prev_spk = merged[-1]
+        if spk == prev_spk and (start - prev_end) < gap_threshold:
+            merged[-1] = (prev_start, end, spk)
+        else:
+            merged.append((start, end, spk))
 
     return merged
 
@@ -421,8 +427,15 @@ def extract_embeddings(emb_sess, audio, segments, step_callback=None):
 # Clustering
 # ---------------------------------------------------------------------------
 
+COSINE_DIST_THRESHOLD = 0.80  # max cosine distance within a cluster
+
+
 def cluster_speakers(embeddings):
-    """Cluster speaker embeddings using spectral clustering.
+    """Cluster speaker embeddings using agglomerative clustering.
+
+    Uses average-linkage with cosine distance and a fixed distance threshold,
+    which handles unbalanced speaker ratios (e.g. 25:1) better than
+    eigengap-based spectral clustering.
 
     Args:
         embeddings: (N, 192) float32 array.
@@ -430,27 +443,26 @@ def cluster_speakers(embeddings):
     Returns:
         list of int — cluster labels (0, 1, 2, ...).
     """
-    from spectralcluster import SpectralClusterer
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.preprocessing import normalize
 
     if len(embeddings) <= 1:
         return [0] * len(embeddings)
 
-    # Replace any NaN/zero embeddings with small random noise to avoid
-    # division-by-zero in spectralcluster's normalization
+    # L2-normalize so cosine distance = 1 - dot product
     clean = embeddings.copy()
-    for i in range(len(clean)):
-        norm = np.linalg.norm(clean[i])
-        if norm < 1e-8 or np.any(np.isnan(clean[i])):
-            clean[i] = np.random.randn(clean.shape[1]).astype(np.float32) * 1e-4
-            clean[i] /= np.linalg.norm(clean[i])
+    norms = np.linalg.norm(clean, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    clean = clean / norms
 
-    clusterer = SpectralClusterer(
-        min_clusters=1,
-        max_clusters=10,
-        refinement_options=None,
+    clusterer = AgglomerativeClustering(
+        n_clusters=None,
+        metric="cosine",
+        linkage="average",
+        distance_threshold=COSINE_DIST_THRESHOLD,
     )
 
-    labels = clusterer.predict(clean)
+    labels = clusterer.fit_predict(clean)
     return labels.tolist()
 
 
@@ -484,7 +496,7 @@ def diarize(seg_sess, emb_sess, audio, step_callback=None):
         emb_sess, audio, segments, step_callback=step_callback
     )
 
-    # Step 3: Spectral clustering
+    # Step 3: Agglomerative clustering
     labels = cluster_speakers(embeddings)
 
     # Map local segment speaker IDs to global cluster labels
