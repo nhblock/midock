@@ -69,6 +69,12 @@ if platform.system() == "Windows":
 # ---------------------------------------------------------------------------
 VENDOR_ID  = 0x10D6
 PRODUCT_ID = 0xB00E
+
+# Supported devices: (VID, PID, description)
+SUPPORTED_DEVICES = [
+    (0x10D6, 0xB00E, "HiDock P1"),
+    (0x3887, 0x2041, "HiDock P1 mini"),
+]
 EP_OUT     = 0x01   # Bulk OUT to device
 EP_IN      = 0x82   # Bulk IN from device
 INTERFACE  = 0
@@ -155,10 +161,17 @@ def parse_packet(data: bytearray, offset: int = 0):
 # ---------------------------------------------------------------------------
 
 def open_device():
-    dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+    # Try each supported device
+    dev = None
+    for vid, pid, desc in SUPPORTED_DEVICES:
+        dev = usb.core.find(idVendor=vid, idProduct=pid)
+        if dev is not None:
+            break
+
     if dev is None:
+        names = ", ".join(d[2] for d in SUPPORTED_DEVICES)
         raise RuntimeError(
-            "HiDock P1 not found. Is it plugged in?\n"
+            f"No supported device found ({names}). Is it plugged in?\n"
             "  - Windows: Install WinUSB driver via Zadig (see README.md)\n"
             "  - WSL2: Run 'usbipd attach --wsl --busid X-Y' in PowerShell"
         )
@@ -171,8 +184,8 @@ def open_device():
         pass  # Windows doesn't support kernel driver operations
     dev.set_configuration()
     usb.util.claim_interface(dev, INTERFACE)
-    product_name = dev.product or "HiDock_P1"
-    print(f"[*] Connected: {product_name} (VID:{VENDOR_ID:#06x} PID:{PRODUCT_ID:#06x})")
+    product_name = dev.product or desc
+    print(f"[*] Connected: {product_name} (VID:{vid:#06x} PID:{pid:#06x})")
     return dev
 
 def close_device(dev):
