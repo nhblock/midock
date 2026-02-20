@@ -793,9 +793,8 @@ class HiDockApp(ctk.CTk):
         d = self.config.get(key, "")
         if not d:
             return "No folder set"
-        if len(d) > 35:
-            return "..." + d[-32:]
-        return d
+        folder_name = os.path.basename(os.path.normpath(d))
+        return f".../{folder_name}"
 
     def _on_choose_download_dir(self):
         initial = self.config.get("download_dir", "") or None
