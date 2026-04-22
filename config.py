@@ -15,6 +15,9 @@ _DEFAULTS = {
     "transcript_output_dir": "",
     "diarize_enabled": False,
     "show_timecodes": False,
+    "watch_dir": "",
+    "local_files": [],
+    "transcribed_files": [],
 }
 
 

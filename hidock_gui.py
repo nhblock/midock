@@ -7,9 +7,19 @@ and transcribing recordings from the HiDock P1 USB recorder.
 
 import os
 import subprocess
+import sys
 import threading
-import tkinter as tk
 from datetime import datetime
+
+# Enable crisp high-DPI rendering on Windows (must precede tkinter import)
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor DPI aware
+    except Exception:
+        pass
+
+import tkinter as tk
 from tkinter import filedialog
 
 import customtkinter as ctk
@@ -66,28 +76,71 @@ def parse_file_datetime(f_info):
     return datetime(1970, 1, 1)
 
 
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".wma", ".hda"}
+
+
+def probe_duration(path):
+    """Get audio duration in seconds using ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=10
+        )
+        return int(float(result.stdout.strip()))
+    except Exception:
+        return 0
+
+
+def scan_audio_files(directory):
+    """Scan directory for audio files, return list of file_info dicts."""
+    results = []
+    if not directory or not os.path.isdir(directory):
+        return results
+    for entry in os.scandir(directory):
+        if not entry.is_file():
+            continue
+        ext = os.path.splitext(entry.name)[1].lower()
+        if ext not in AUDIO_EXTENSIONS:
+            continue
+        stat = entry.stat()
+        dt = datetime.fromtimestamp(stat.st_mtime)
+        results.append({
+            "name": entry.name,
+            "size": stat.st_size,
+            "duration": 0,  # probed in background
+            "date": dt.strftime("%Y/%m/%d"),
+            "time": dt.strftime("%H:%M:%S"),
+            "mode": "",
+            "path": entry.path,
+        })
+    return results
+
+
 # ---------------------------------------------------------------------------
 # NPU utilization chart
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Color palette (Vertdure)
+# Color palette (Slate Dark)
 # ---------------------------------------------------------------------------
 
-CLR_GREEN        = "#61BF36"   # primary buttons, accents
-CLR_GREEN_DARK   = "#3A591B"   # sidebar bg, section headers
-CLR_GREEN_DEEP   = "#1e2e12"   # main panel bg
-CLR_YELLOW       = "#F2E205"   # highlight accent
-CLR_GOLD         = "#F2CB05"   # secondary accent
-CLR_AMBER        = "#D9961A"   # delete / warning
-CLR_BG_DARK      = "#141c0c"   # darkest background
-CLR_BG_PANEL     = "#1a2410"   # main panel background
-CLR_HEADER       = "#2a3a18"   # section header bars
-CLR_SEP          = "#3A591B"   # separator lines
-CLR_TEXT         = "#e8f0e0"   # primary text
-CLR_TEXT_DIM     = "#8a9a78"   # secondary / muted text
-CLR_TEXT_BRIGHT  = "#ffffff"   # bright text
-CLR_RED          = "#c04030"   # error text
+CLR_GREEN        = "#4ade80"   # success accent, primary actions
+CLR_GREEN_DARK   = "#151b23"   # sidebar bg, dark elevated surfaces
+CLR_GREEN_DEEP   = "#0d1117"   # deepest content background
+CLR_YELLOW       = "#e3b341"   # highlight / transcribe accent
+CLR_GOLD         = "#d29922"   # secondary warm accent
+CLR_AMBER        = "#da6e2a"   # delete / warning
+CLR_BG_DARK      = "#010409"   # absolute darkest (chart bg)
+CLR_BG_PANEL     = "#0d1117"   # main panel background
+CLR_HEADER       = "#161b22"   # section header bars
+CLR_SEP          = "#21262d"   # separator lines / borders
+CLR_TEXT         = "#d1d5db"   # primary text
+CLR_TEXT_DIM     = "#7d8590"   # secondary / muted text
+CLR_TEXT_BRIGHT  = "#f0f6fc"   # bright text
+CLR_RED          = "#f85149"   # error text
+CLR_SECTION      = "#8b949e"   # section header labels
+CLR_ROW_ALT      = "#161b22"   # alternating row background
 
 
 class ProcessorChart(tk.Canvas):
@@ -104,10 +157,10 @@ class ProcessorChart(tk.Canvas):
     # NPU colors
     BAR_NPU = CLR_GREEN
     BAR_NPU_ENCODER = CLR_YELLOW
-    BAR_NPU_DIM = "#2a4018"
+    BAR_NPU_DIM = "#1a3328"
     # CPU colors
-    BAR_CPU = "#4a9eff"
-    BAR_CPU_DIM = "#1a3a5c"
+    BAR_CPU = "#58a6ff"
+    BAR_CPU_DIM = "#1a2d4a"
     REDRAW_MS = 40         # throttle: max ~25 fps
 
     def __init__(self, master, **kwargs):
@@ -200,7 +253,7 @@ class ProcessorChart(tk.Canvas):
 # Column widths shared by header and rows
 # col 0=checkbox(28), 1=name(flex), 2=size(72), 3=duration(90), 4=date(160), 5=mode(62), 6=dl(36)
 _COL_WIDTHS = {2: 72, 3: 90, 4: 160, 5: 62, 6: 36}
-_MONO = ("Consolas", 13)
+_MONO = ("Cascadia Mono", 13)
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +263,14 @@ _MONO = ("Consolas", 13)
 class FileRow(ctk.CTkFrame):
     """A single row in the file list representing one recording."""
 
-    def __init__(self, master, file_info, **kwargs):
+    def __init__(self, master, file_info, row_index=0, **kwargs):
         super().__init__(master, **kwargs)
         self.file_info = file_info
         self.selected = ctk.BooleanVar(value=False)
-        self.downloaded_path = None  # set after download
+        self.downloaded_path = file_info.get("path")  # set for local files, None for device
 
-        self.configure(fg_color="transparent")
+        bg = CLR_ROW_ALT if row_index % 2 == 0 else "transparent"
+        self.configure(fg_color=bg)
         self.grid_columnconfigure(1, weight=1)
 
         font = ctk.CTkFont(family=_MONO[0], size=_MONO[1])
@@ -236,10 +290,12 @@ class FileRow(ctk.CTkFrame):
             font=font, width=_COL_WIDTHS[2]
         ).grid(row=0, column=2, padx=4, pady=2)
 
-        ctk.CTkLabel(
-            self, text=fmt_duration(file_info["duration"]), anchor="e",
+        dur_text = fmt_duration(file_info["duration"]) if file_info["duration"] else "..."
+        self.dur_label = ctk.CTkLabel(
+            self, text=dur_text, anchor="e",
             font=font, width=_COL_WIDTHS[3]
-        ).grid(row=0, column=3, padx=4, pady=2)
+        )
+        self.dur_label.grid(row=0, column=3, padx=4, pady=2)
 
         date_time = f"{file_info['date']} {file_info['time']}".strip()
         ctk.CTkLabel(
@@ -247,8 +303,9 @@ class FileRow(ctk.CTkFrame):
             font=font, width=_COL_WIDTHS[4]
         ).grid(row=0, column=4, padx=4, pady=2)
 
+        mode_text = file_info["mode"] if file_info.get("mode") else "-"
         ctk.CTkLabel(
-            self, text=file_info["mode"], anchor="w",
+            self, text=mode_text, anchor="w",
             font=font, width=_COL_WIDTHS[5]
         ).grid(row=0, column=5, padx=4, pady=2)
 
@@ -262,6 +319,13 @@ class FileRow(ctk.CTkFrame):
         self.downloaded_path = path
         self.dl_label.configure(text="[yes]", text_color=CLR_GREEN)
 
+    def mark_transcribed(self):
+        self.dl_label.configure(text="[done]", text_color=CLR_GREEN)
+
+    def update_duration(self, seconds):
+        self.file_info["duration"] = seconds
+        self.dur_label.configure(text=fmt_duration(seconds))
+
 
 # ---------------------------------------------------------------------------
 # Main application
@@ -271,7 +335,7 @@ class HiDockApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("HiDock P1")
+        self.title("MiDock")
         self.geometry("1150x900")
         self.minsize(950, 520)
 
@@ -287,6 +351,13 @@ class HiDockApp(ctk.CTk):
         self.whisper_loading = False
         self.diarize_sessions = None  # (seg_sess, emb_sess) for diarization
         self.config = config.load()
+        # Default watch_dir to user's Downloads folder
+        if not self.config.get("watch_dir"):
+            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            if os.path.isdir(downloads):
+                self.config["watch_dir"] = downloads
+                config.save(self.config)
+        self.view_mode = "device"    # "device" or "local"
         self.sort_key = "date"       # "date" or "duration"
         self.sort_desc = True        # descending by default
 
@@ -315,7 +386,7 @@ class HiDockApp(ctk.CTk):
         btn_radius = 10
 
         self.title_label = ctk.CTkLabel(
-            self.sidebar, text="HiDock P1",
+            self.sidebar, text="MiDock",
             font=ctk.CTkFont(size=22, weight="bold"),
             text_color=CLR_TEXT_BRIGHT
         )
@@ -325,11 +396,17 @@ class HiDockApp(ctk.CTk):
             self.sidebar, text="USB Recording Manager",
             font=ctk.CTkFont(size=13), text_color=CLR_TEXT_DIM
         )
-        self.subtitle_label.pack(padx=20, pady=(0, 16))
+        self.subtitle_label.pack(padx=20, pady=(0, 12))
+
+        ctk.CTkLabel(
+            self.sidebar, text="DEVICE", anchor="w",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=CLR_SECTION
+        ).pack(padx=24, pady=(8, 6), fill="x")
 
         self.connect_btn = ctk.CTkButton(
             self.sidebar, text="Connect", command=self._on_connect,
-            fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
+            fg_color=CLR_GREEN, hover_color="#22c55e", text_color="#052e16",
             font=btn_font, height=btn_h, corner_radius=btn_radius
         )
         self.connect_btn.pack(padx=20, pady=btn_pad, fill="x")
@@ -349,7 +426,7 @@ class HiDockApp(ctk.CTk):
         self.battery_row = ctk.CTkFrame(self.info_frame, fg_color="transparent")
         self.battery_row.pack(fill="x")
         self.battery_canvas = tk.Canvas(
-            self.battery_row, width=28, height=14, bg=CLR_BG_PANEL,
+            self.battery_row, width=28, height=14, bg=CLR_GREEN_DARK,
             highlightthickness=0
         )
         self.battery_canvas.pack(side="left", pady=2)
@@ -365,13 +442,16 @@ class HiDockApp(ctk.CTk):
             lbl.pack(fill="x")
             setattr(self, attr, lbl)
 
-        sep = ctk.CTkFrame(self.sidebar, height=1, fg_color=CLR_SEP)
-        sep.pack(padx=20, pady=10, fill="x")
+        ctk.CTkLabel(
+            self.sidebar, text="ACTIONS", anchor="w",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=CLR_SECTION
+        ).pack(padx=24, pady=(16, 6), fill="x")
 
         self.dl_selected_btn = ctk.CTkButton(
             self.sidebar, text="Download Selected",
             command=self._on_download_selected, state="disabled",
-            fg_color="#89d466", hover_color="#4ea02a", text_color=CLR_GREEN_DARK,
+            fg_color="#1c3024", hover_color="#22c55e", text_color="#3a6a48",
             font=btn_font, height=btn_h, corner_radius=btn_radius
         )
         self.dl_selected_btn.pack(padx=20, pady=btn_pad, fill="x")
@@ -379,18 +459,22 @@ class HiDockApp(ctk.CTk):
         self.delete_btn = ctk.CTkButton(
             self.sidebar, text="Delete Selected",
             command=self._on_delete_selected, state="disabled",
-            fg_color="#e6be6a", hover_color="#c07a10", text_color="#6b4a0d",
+            fg_color="transparent", hover_color="#2a1518",
+            text_color="#7a4040", border_color="#3a2525", border_width=1,
             font=btn_font, height=btn_h, corner_radius=btn_radius
         )
         self.delete_btn.pack(padx=20, pady=btn_pad, fill="x")
 
-        sep2 = ctk.CTkFrame(self.sidebar, height=1, fg_color=CLR_SEP)
-        sep2.pack(padx=20, pady=10, fill="x")
+        ctk.CTkLabel(
+            self.sidebar, text="TRANSCRIPTION", anchor="w",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=CLR_SECTION
+        ).pack(padx=24, pady=(16, 6), fill="x")
 
         self.transcribe_btn = ctk.CTkButton(
             self.sidebar, text="Transcribe",
             command=self._on_transcribe, state="disabled",
-            fg_color="#f5ee6e", hover_color=CLR_GOLD, text_color="#6b6b04",
+            fg_color="#2a2610", hover_color=CLR_GOLD, text_color="#6a6020",
             font=btn_font, height=btn_h, corner_radius=btn_radius
         )
         self.transcribe_btn.pack(padx=20, pady=btn_pad, fill="x")
@@ -429,14 +513,18 @@ class HiDockApp(ctk.CTk):
         )
         self.model_label.pack(padx=24, pady=(0, 8), anchor="w")
 
-        sep3 = ctk.CTkFrame(self.sidebar, height=1, fg_color=CLR_SEP)
-        sep3.pack(padx=20, pady=10, fill="x")
+        ctk.CTkLabel(
+            self.sidebar, text="FOLDERS", anchor="w",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=CLR_SECTION
+        ).pack(padx=24, pady=(16, 6), fill="x")
 
         self.dl_dir_btn = ctk.CTkButton(
             self.sidebar, text="Set Download Folder",
             command=self._on_choose_download_dir,
-            fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
-            font=btn_font, height=btn_h, corner_radius=btn_radius
+            fg_color="transparent", hover_color=CLR_HEADER,
+            text_color=CLR_TEXT_DIM, border_color=CLR_SEP, border_width=1,
+            font=ctk.CTkFont(size=12), height=30, corner_radius=btn_radius
         )
         self.dl_dir_btn.pack(padx=20, pady=btn_pad, fill="x")
 
@@ -446,11 +534,27 @@ class HiDockApp(ctk.CTk):
         )
         self.dl_dir_label.pack(padx=20, pady=(2, 4))
 
+        self.watch_dir_btn = ctk.CTkButton(
+            self.sidebar, text="Set Watch Folder",
+            command=self._on_choose_watch_dir,
+            fg_color="transparent", hover_color=CLR_HEADER,
+            text_color=CLR_TEXT_DIM, border_color=CLR_SEP, border_width=1,
+            font=ctk.CTkFont(size=12), height=30, corner_radius=btn_radius
+        )
+        self.watch_dir_btn.pack(padx=20, pady=btn_pad, fill="x")
+
+        self.watch_dir_label = ctk.CTkLabel(
+            self.sidebar, text=self._format_config_dir("watch_dir"),
+            font=ctk.CTkFont(size=11), text_color=CLR_TEXT_DIM, wraplength=210
+        )
+        self.watch_dir_label.pack(padx=20, pady=(2, 4))
+
         self.output_dir_btn = ctk.CTkButton(
             self.sidebar, text="Set Transcript Folder",
             command=self._on_choose_output_dir,
-            fg_color=CLR_GREEN, hover_color="#4ea02a", text_color=CLR_TEXT_BRIGHT,
-            font=btn_font, height=btn_h, corner_radius=btn_radius
+            fg_color="transparent", hover_color=CLR_HEADER,
+            text_color=CLR_TEXT_DIM, border_color=CLR_SEP, border_width=1,
+            font=ctk.CTkFont(size=12), height=30, corner_radius=btn_radius
         )
         self.output_dir_btn.pack(padx=20, pady=btn_pad, fill="x")
 
@@ -470,17 +574,42 @@ class HiDockApp(ctk.CTk):
         # row 3 = NPU chart (fixed height strip)
         self.main_panel.grid_columnconfigure(0, weight=1)
 
-        # File list container: header + scrollable area stacked
+        # File list container: toolbar + header + scrollable area stacked
         file_container = ctk.CTkFrame(self.main_panel, fg_color="transparent")
         file_container.grid(row=0, column=0, sticky="nswe", padx=0, pady=0)
-        file_container.grid_rowconfigure(1, weight=1)
+        file_container.grid_rowconfigure(2, weight=1)
         file_container.grid_columnconfigure(0, weight=1)
 
-        # File list scrollable area (create first to measure internal offset)
+        # Source toggle toolbar
+        toolbar = ctk.CTkFrame(file_container, height=36, fg_color=CLR_BG_DARK,
+                                corner_radius=0)
+        toolbar.grid(row=0, column=0, sticky="nwe", padx=0, pady=0)
+        toolbar.grid_propagate(False)
+
+        self.source_toggle = ctk.CTkSegmentedButton(
+            toolbar, values=["HiDock", "Downloads"],
+            command=self._on_view_toggle,
+            font=ctk.CTkFont(size=12, weight="bold"), height=28,
+            selected_color=CLR_GREEN, selected_hover_color="#22c55e",
+            unselected_color=CLR_GREEN_DARK, unselected_hover_color="#21262d",
+            text_color=CLR_TEXT_BRIGHT
+        )
+        self.source_toggle.set("HiDock")
+        self.source_toggle.pack(side="left", padx=(8, 4), pady=4)
+
+        self.open_files_btn = ctk.CTkButton(
+            toolbar, text="Open Files...", width=100, height=28,
+            font=ctk.CTkFont(size=12), fg_color=CLR_HEADER,
+            hover_color="#21262d", text_color=CLR_TEXT,
+            corner_radius=6, command=self._on_open_files
+        )
+        self.open_files_btn.pack(side="left", padx=4, pady=4)
+
+        # File list scrollable area
         self.file_list_frame = ctk.CTkScrollableFrame(
             file_container, fg_color="transparent"
         )
-        self.file_list_frame.grid(row=1, column=0, sticky="nswe", padx=0, pady=0)
+        self.file_list_frame.grid(row=2, column=0, sticky="nswe", padx=0, pady=0)
         self.file_list_frame.grid_columnconfigure(0, weight=1)
 
         # Header — padx matches scrollable frame's internal border + scrollbar
@@ -489,7 +618,7 @@ class HiDockApp(ctk.CTk):
         hdr_pad_r = 17
         header_frame = ctk.CTkFrame(file_container, height=30,
                                      fg_color=CLR_HEADER, corner_radius=0)
-        header_frame.grid(row=0, column=0, sticky="nwe", padx=(hdr_pad_l, hdr_pad_r), pady=0)
+        header_frame.grid(row=1, column=0, sticky="nwe", padx=(hdr_pad_l, hdr_pad_r), pady=0)
         header_frame.grid_propagate(False)
         header_frame.grid_columnconfigure(1, weight=1)
 
@@ -544,7 +673,7 @@ class HiDockApp(ctk.CTk):
         # Placeholder when no files
         self.placeholder_label = ctk.CTkLabel(
             self.file_list_frame,
-            text="Connect a device to view recordings",
+            text="Connect a device or switch to Downloads view",
             text_color=CLR_TEXT_DIM, font=ctk.CTkFont(size=14)
         )
         self.placeholder_label.pack(pady=40)
@@ -585,7 +714,7 @@ class HiDockApp(ctk.CTk):
 
         self.transcript_box = ctk.CTkTextbox(
             self.main_panel, state="disabled",
-            font=ctk.CTkFont(family="Consolas", size=13),
+            font=ctk.CTkFont(family="Cascadia Mono", size=13),
             fg_color=CLR_GREEN_DEEP, text_color=CLR_TEXT
         )
         self.transcript_box.grid(row=2, column=0, sticky="nswe", padx=0, pady=(30, 0))
@@ -645,15 +774,29 @@ class HiDockApp(ctk.CTk):
     def _set_buttons_state(self, connected=False, has_downloads=False):
         def _apply():
             if connected:
-                self.dl_selected_btn.configure(state="normal", fg_color=CLR_GREEN, text_color=CLR_TEXT_BRIGHT)
-                self.delete_btn.configure(state="normal", fg_color=CLR_AMBER, text_color=CLR_TEXT_BRIGHT)
+                self.dl_selected_btn.configure(
+                    state="normal", fg_color=CLR_GREEN, text_color="#052e16"
+                )
+                self.delete_btn.configure(
+                    state="normal", fg_color="transparent",
+                    text_color=CLR_RED, border_color=CLR_RED
+                )
             else:
-                self.dl_selected_btn.configure(state="disabled", fg_color="#89d466", text_color=CLR_GREEN_DARK)
-                self.delete_btn.configure(state="disabled", fg_color="#e6be6a", text_color="#6b4a0d")
+                self.dl_selected_btn.configure(
+                    state="disabled", fg_color="#1c3024", text_color="#3a6a48"
+                )
+                self.delete_btn.configure(
+                    state="disabled", fg_color="transparent",
+                    text_color="#7a4040", border_color="#3a2525"
+                )
             if has_downloads:
-                self.transcribe_btn.configure(state="normal", fg_color=CLR_YELLOW, text_color=CLR_GREEN_DARK)
+                self.transcribe_btn.configure(
+                    state="normal", fg_color=CLR_YELLOW, text_color="#1a1800"
+                )
             else:
-                self.transcribe_btn.configure(state="disabled", fg_color="#f5ee6e", text_color="#6b6b04")
+                self.transcribe_btn.configure(
+                    state="disabled", fg_color="#2a2610", text_color="#6a6020"
+                )
         self.after(0, _apply)
 
     def _draw_battery_icon(self, pct):
@@ -734,8 +877,8 @@ class HiDockApp(ctk.CTk):
                 self.placeholder_label.pack(pady=40)
                 return
 
-            for f_info in self._sorted_files():
-                row = FileRow(self.file_list_frame, f_info)
+            for idx, f_info in enumerate(self._sorted_files()):
+                row = FileRow(self.file_list_frame, f_info, row_index=idx)
                 row.pack(fill="x", padx=4, pady=1)
                 self.file_rows.append(row)
         self.after(0, _apply)
@@ -748,8 +891,14 @@ class HiDockApp(ctk.CTk):
             self.sort_key = key
             self.sort_desc = True
         self._update_sort_buttons()
-        self._populate_file_list()
-        self.after(10, self._check_existing_downloads)
+        if self.view_mode == "device":
+            if self.files:
+                self._populate_file_list()
+                self.after(10, self._check_existing_downloads)
+            else:
+                self._refresh_device_view()
+        else:
+            self._refresh_local_view()
 
     def _update_sort_buttons(self):
         arrow = " v" if self.sort_desc else " ^"
@@ -806,6 +955,17 @@ class HiDockApp(ctk.CTk):
             self.dl_dir_label.configure(text=self._format_config_dir("download_dir"))
             self._check_existing_downloads()
 
+    def _on_choose_watch_dir(self):
+        initial = self.config.get("watch_dir", "") or None
+        d = filedialog.askdirectory(title="Choose watch folder",
+                                    initialdir=initial)
+        if d:
+            self.config["watch_dir"] = d
+            config.save(self.config)
+            self.watch_dir_label.configure(text=self._format_config_dir("watch_dir"))
+            if self.view_mode == "local":
+                self._refresh_local_view()
+
     def _on_choose_output_dir(self):
         initial = self.config.get("transcript_output_dir", "") or None
         d = filedialog.askdirectory(title="Choose transcript output folder",
@@ -816,6 +976,156 @@ class HiDockApp(ctk.CTk):
             self.output_dir_label.configure(
                 text=self._format_config_dir("transcript_output_dir")
             )
+
+    # -----------------------------------------------------------------------
+    # View switching (Device / Local)
+    # -----------------------------------------------------------------------
+
+    def _on_view_toggle(self, value):
+        """Handle source toggle: 'HiDock' or 'Downloads'."""
+        if value == "HiDock":
+            self.view_mode = "device"
+            self._refresh_device_view()
+        else:
+            self.view_mode = "local"
+            self._refresh_local_view()
+
+    def _refresh_device_view(self):
+        """Populate file list from device files or download folder scan."""
+        if self.files:
+            # Device is connected, show device files
+            self._populate_file_list()
+            self.after(10, self._check_existing_downloads)
+        else:
+            # No device — scan download folder for previously downloaded files
+            dl_dir = self.config.get("download_dir", "")
+            if dl_dir:
+                local_files = scan_audio_files(dl_dir)
+                self._populate_local_file_list(local_files)
+            else:
+                self._populate_local_file_list([])
+
+    def _refresh_local_view(self):
+        """Populate file list from watch folder + one-off local files."""
+        watch_dir = self.config.get("watch_dir", "")
+        folder_files = scan_audio_files(watch_dir)
+
+        # Add one-off files from config
+        local_paths = self.config.get("local_files", [])
+        seen = {f["path"] for f in folder_files}
+        for path in local_paths:
+            if path not in seen and os.path.isfile(path):
+                stat = os.stat(path)
+                dt = datetime.fromtimestamp(stat.st_mtime)
+                folder_files.append({
+                    "name": os.path.basename(path),
+                    "size": stat.st_size,
+                    "duration": 0,
+                    "date": dt.strftime("%Y/%m/%d"),
+                    "time": dt.strftime("%H:%M:%S"),
+                    "mode": "",
+                    "path": path,
+                })
+
+        self._populate_local_file_list(folder_files)
+
+    def _populate_local_file_list(self, file_infos):
+        """Populate file list from local file_info dicts and probe durations."""
+        transcribed = {os.path.normpath(p) for p in self.config.get("transcribed_files", [])}
+
+        def _apply():
+            for row in self.file_rows:
+                row.destroy()
+            self.file_rows.clear()
+            self.placeholder_label.pack_forget()
+            self.select_all_var.set(False)
+
+            if not file_infos:
+                self.placeholder_label.configure(
+                    text="No audio files found — set a folder or use Open Files"
+                )
+                self.placeholder_label.pack(pady=40)
+                self._update_buttons_for_view()
+                return
+
+            # Sort using same sort key
+            if self.sort_key == "date":
+                key_fn = parse_file_datetime
+            else:
+                key_fn = lambda f: f.get("duration", 0)
+            sorted_infos = sorted(file_infos, key=key_fn, reverse=self.sort_desc)
+
+            for idx, f_info in enumerate(sorted_infos):
+                row = FileRow(self.file_list_frame, f_info, row_index=idx)
+                row.pack(fill="x", padx=4, pady=1)
+                self.file_rows.append(row)
+                # Mark already-transcribed files
+                if f_info.get("path") and os.path.normpath(f_info["path"]) in transcribed:
+                    row.mark_transcribed()
+
+            self._update_buttons_for_view()
+
+        self.after(0, _apply)
+        # Probe durations in background
+        self.after(50, lambda: threading.Thread(
+            target=self._probe_durations, args=(file_infos,), daemon=True
+        ).start())
+
+    def _probe_durations(self, file_infos):
+        """Background thread: probe duration for each file and update UI."""
+        for f_info in file_infos:
+            if f_info["duration"] == 0 and f_info.get("path"):
+                dur = probe_duration(f_info["path"])
+                if dur > 0:
+                    f_info["duration"] = dur
+                    # Update the matching row on the main thread
+                    self.after(0, lambda fi=f_info, d=dur: self._update_row_duration(fi, d))
+
+    def _update_row_duration(self, f_info, dur):
+        """Update the duration label on the matching file row."""
+        for row in self.file_rows:
+            if row.file_info is f_info:
+                row.update_duration(dur)
+                break
+
+    def _update_buttons_for_view(self):
+        """Enable/disable buttons based on current view and available files."""
+        has_files = any(row.downloaded_path for row in self.file_rows)
+        connected = self.dev is not None
+        self._set_buttons_state(connected=connected, has_downloads=has_files)
+
+    def _mark_file_transcribed(self, path, row):
+        """Record a file as transcribed in config and update its row."""
+        transcribed = list(self.config.get("transcribed_files", []))
+        norm = os.path.normpath(path)
+        if norm not in transcribed:
+            transcribed.append(norm)
+            self.config["transcribed_files"] = transcribed
+            config.save(self.config)
+        self.after(0, row.mark_transcribed)
+
+    def _on_open_files(self):
+        """Open file dialog for one-off audio files."""
+        ext_list = " ".join(f"*{e}" for e in sorted(AUDIO_EXTENSIONS))
+        paths = filedialog.askopenfilenames(
+            title="Select audio files to transcribe",
+            filetypes=[("Audio files", ext_list), ("All files", "*.*")]
+        )
+        if not paths:
+            return
+
+        # Persist new paths in config
+        local_files = list(self.config.get("local_files", []))
+        for p in paths:
+            if p not in local_files:
+                local_files.append(p)
+        self.config["local_files"] = local_files
+        config.save(self.config)
+
+        # Switch to local view and refresh
+        self.view_mode = "local"
+        self.source_toggle.set("Downloads")
+        self._refresh_local_view()
 
     # -----------------------------------------------------------------------
     # Connect / Disconnect
@@ -866,11 +1176,17 @@ class HiDockApp(ctk.CTk):
             ))
         except Exception as e:
             self.dev = None
-            self._set_status(f"Connection failed: {e}")
             self._set_progress_mode(indeterminate=False)
             self.after(0, lambda: self.connect_btn.configure(
                 state="normal", text="Connect"
             ))
+            # No device — show download folder contents for offline transcription
+            self.after(0, self._refresh_device_view)
+            dl_dir = self.config.get("download_dir", "")
+            if dl_dir:
+                self._set_status("No device — showing downloaded files")
+            else:
+                self._set_status("No device connected")
 
     def _disconnect(self):
         if self.dev is not None:
@@ -889,7 +1205,11 @@ class HiDockApp(ctk.CTk):
         self.battery_label.configure(text="")
         self.storage_label.configure(text="")
         self.files_label.configure(text="")
-        self._populate_file_list()
+        # Show downloaded files for offline transcription
+        if self.view_mode == "device":
+            self._refresh_device_view()
+        else:
+            self._refresh_local_view()
         self._set_buttons_state(connected=False)
         self.connect_btn.configure(text="Connect")
         self._set_status("Disconnected")
@@ -1042,12 +1362,11 @@ class HiDockApp(ctk.CTk):
         selected = [r for r in self.file_rows
                     if r.selected.get() and r.downloaded_path is not None]
         if not selected:
-            self._set_status("No selected files with downloads to transcribe")
+            self._set_status("No selected files to transcribe")
             return
-        downloaded = selected
         self.transcribe_btn.configure(state="disabled")
         threading.Thread(
-            target=self._transcribe_worker, args=(downloaded,), daemon=True
+            target=self._transcribe_worker, args=(selected,), daemon=True
         ).start()
 
     def _load_whisper(self):
@@ -1142,6 +1461,14 @@ class HiDockApp(ctk.CTk):
 
         self.after(0, self.proc_chart.clear)
 
+        # Ensure durations are probed (may be 0 for local files)
+        for row in rows:
+            if row.file_info["duration"] == 0 and row.downloaded_path:
+                dur = probe_duration(row.downloaded_path)
+                if dur > 0:
+                    row.file_info["duration"] = dur
+                    self.after(0, lambda r=row, d=dur: r.update_duration(d))
+
         # Compute total audio duration for time-based progress
         total_audio_s = sum(row.file_info["duration"] for row in rows)
         files_done_s = 0.0
@@ -1173,6 +1500,9 @@ class HiDockApp(ctk.CTk):
                     os.makedirs(output_dir, exist_ok=True)
                     with open(txt_path, "w", encoding="utf-8") as f:
                         f.write(text)
+
+                # Track transcribed file
+                self._mark_file_transcribed(mp3_path, row)
             except Exception as e:
                 self._append_transcript(f"\n--- {filename} ---\n[Error: {e}]\n")
 
