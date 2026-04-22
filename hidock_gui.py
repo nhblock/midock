@@ -78,6 +78,40 @@ def parse_file_datetime(f_info):
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".wma", ".hda"}
 
+# Formats audio2numpy decodes natively — transcribe doesn't need to convert these.
+TRANSCRIBE_NATIVE_EXTENSIONS = {".mp3", ".wav"}
+
+
+def ensure_mp3(src_path):
+    """Return an mp3 path for src_path, converting via ffmpeg if needed.
+
+    Returns src_path unchanged for formats audio2numpy handles natively.
+    For other formats, produces a sibling <base>.mp3 (or reuses an existing
+    one). Raises RuntimeError on ffmpeg failure.
+    """
+    ext = os.path.splitext(src_path)[1].lower()
+    if ext in TRANSCRIBE_NATIVE_EXTENSIONS:
+        return src_path
+
+    mp3_path = os.path.splitext(src_path)[0] + ".mp3"
+    if os.path.exists(mp3_path):
+        return mp3_path
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-i", src_path, "-y", mp3_path],
+            capture_output=True, text=True, timeout=120
+        )
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found — install ffmpeg and add to PATH")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffmpeg timed out converting {os.path.basename(src_path)}")
+
+    if result.returncode != 0 or not os.path.exists(mp3_path):
+        raise RuntimeError(f"ffmpeg failed: {result.stderr[:200]}")
+
+    return mp3_path
+
 
 def probe_duration(path):
     """Get audio duration in seconds using ffprobe."""
@@ -1476,10 +1510,19 @@ class HiDockApp(ctk.CTk):
         output_dir = self.config.get("transcript_output_dir", "")
 
         for idx, row in enumerate(rows, 1):
-            mp3_path = row.downloaded_path
-            filename = os.path.basename(mp3_path)
+            src_path = row.downloaded_path
+            filename = os.path.basename(src_path)
 
             try:
+                src_ext = os.path.splitext(src_path)[1].lower()
+                if src_ext not in TRANSCRIBE_NATIVE_EXTENSIONS:
+                    self._set_status(f"Converting {idx}/{total}: {filename} -> .mp3")
+                    mp3_path = ensure_mp3(src_path)
+                    row.downloaded_path = mp3_path
+                    filename = os.path.basename(mp3_path)
+                else:
+                    mp3_path = src_path
+
                 if use_diarize:
                     text = self._transcribe_file_diarized(
                         mp3_path, filename, idx, total,
